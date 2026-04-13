@@ -1,0 +1,264 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>上市公司财报智能问数助手</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <p class="eyebrow">FINANCE QA CONSOLE</p>
+          <h1>智能问数助手</h1>
+          <p class="brand-copy">围绕财报、研报与结构化指标构建的本地离线问答与管理工作台。</p>
+        </div>
+        <nav class="nav-list">
+          <button class="nav-item active" data-view="workspace">问数工作台</button>
+          <button class="nav-item" data-view="imports">数据导入</button>
+          <button class="nav-item" data-view="questions">问题管理</button>
+          <button class="nav-item" data-view="database">数据库展示</button>
+          <button class="nav-item" data-view="evidence">证据预览</button>
+        </nav>
+        <div class="sidebar-note">
+          <span class="status-dot"></span>
+          <div>
+            <strong>本地离线运行</strong>
+            <p>适合竞赛答辩、系统截图和复现实验环境。</p>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main-stage">
+        <section class="hero-banner">
+          <div>
+            <p class="eyebrow">上市公司财报“智能问数”助手</p>
+            <h2>从能运行，提升到可展示、可管理、可交付</h2>
+            <p class="hero-copy">统一处理数据导入、结果导出、问题沉淀、数据库巡检和证据预览，支撑论文截图与竞赛展示。</p>
+          </div>
+          <div class="hero-actions">
+            <button id="rebuildTopButton" class="ghost-button">重建数据库</button>
+            <button id="exportHistoryButton" class="ghost-button">导出历史</button>
+          </div>
+        </section>
+
+        <section id="overviewStats" class="stats-grid"></section>
+
+        <section id="view-workspace" class="view-panel active">
+          <div class="content-grid workspace-grid">
+            <article class="panel ask-panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Ask</p>
+                  <h3>智能问数区</h3>
+                </div>
+                <span id="askStatus" class="panel-status"></span>
+              </div>
+              <label class="field-label" for="questionInput">输入单个问题，或直接粘贴题目 JSON</label>
+              <textarea id="questionInput" rows="7" placeholder="例如：华润三九 2024 年年度报告的净利润是多少？"></textarea>
+              <div class="button-row">
+                <button id="askButton">开始问数</button>
+                <button id="loadSamplesButton" class="secondary-button">载入样例</button>
+                <button id="resetContextButton" class="secondary-button">清空上下文</button>
+                <button id="exportLatestButton" class="secondary-button">导出本次结果</button>
+              </div>
+              <div id="samplesBox" class="chip-list"></div>
+            </article>
+
+            <article class="panel history-panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">History</p>
+                  <h3>最近问答</h3>
+                </div>
+                <button id="clearHistoryButton" class="text-button">清空</button>
+              </div>
+              <div id="historyList" class="stack-list"></div>
+            </article>
+
+            <article class="panel result-panel span-2">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Result</p>
+                  <h3>回答结果</h3>
+                </div>
+                <span id="exportNotice" class="panel-status"></span>
+              </div>
+              <div id="resultsBox" class="results-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-imports" class="view-panel">
+          <div class="content-grid import-grid">
+            <article class="panel upload-panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Import</p>
+                  <h3>文件导入</h3>
+                </div>
+                <span id="uploadStatus" class="panel-status"></span>
+              </div>
+              <label class="field-label" for="uploadCategory">导入类别</label>
+              <select id="uploadCategory">
+                <option value="manual_source">源文件补充：Excel / PDF / CSV / JSON / TXT</option>
+                <option value="manual_import">结构化补录：CSV 导入财务表</option>
+              </select>
+              <input id="uploadFile" type="file" />
+              <div class="button-row compact-row">
+                <button id="uploadButton">上传文件</button>
+                <button id="rebuildButton" class="secondary-button">上传后重建数据库</button>
+              </div>
+              <div class="tip-box">
+                <strong>建议用法</strong>
+                <p>`manual_source` 用于补充题目源附件，`manual_import` 用于补录结构化 CSV。</p>
+              </div>
+            </article>
+
+            <article class="panel source-panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Source</p>
+                  <h3>核心数据源</h3>
+                </div>
+              </div>
+              <div id="sourceSummary" class="info-list"></div>
+            </article>
+
+            <article class="panel file-panel span-2">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Assets</p>
+                  <h3>文件与产物</h3>
+                </div>
+              </div>
+              <div id="fileSections" class="file-sections"></div>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-questions" class="view-panel">
+          <div class="content-grid question-grid">
+            <article class="panel question-list-panel span-2">
+              <div class="panel-head question-admin-head">
+                <div>
+                  <p class="panel-kicker">Manage</p>
+                  <h3 id="questionPanelTitle">问题管理</h3>
+                </div>
+                <div class="inline-actions question-admin-actions">
+                  <button id="deleteSelectedQuestionsButton" class="secondary-button">删除所选</button>
+                  <button id="clearQuestionFiltersButton" class="ghost-button">重置筛选</button>
+                  <button id="newQuestionButton">创建问题</button>
+                </div>
+              </div>
+              <div id="questionOverview" class="question-overview"></div>
+              <div class="question-toolbar">
+                <label class="question-search-field">
+                  <span>搜索问题</span>
+                  <input id="questionSearch" type="text" placeholder="搜索问题编号、标题、内容或标签" />
+                </label>
+                <div class="question-filter-row">
+                  <select id="questionSourceFilter">
+                    <option value="all">全部来源</option>
+                    <option value="system">系统生成</option>
+                    <option value="official">官方题库</option>
+                    <option value="custom">自定义问题</option>
+                  </select>
+                  <select id="questionTypeFilter">
+                    <option value="all">全部类型</option>
+                  </select>
+                </div>
+              </div>
+              <div id="questionTagBar" class="question-tag-bar"></div>
+              <div id="questionTagSummary" class="meta-line question-filter-summary"></div>
+              <div id="questionLibrary" class="question-table-shell"></div>
+            </article>
+
+            <article class="panel custom-question-panel question-editor-panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Editor</p>
+                  <h3>自定义问题编辑器</h3>
+                </div>
+                <span id="questionStatus" class="panel-status"></span>
+              </div>
+              <p class="question-editor-copy">适合维护论文展示问题、答辩演示脚本和补充测试问题。</p>
+              <label class="field-label" for="questionTitle">问题标题</label>
+              <input id="questionTitle" type="text" placeholder="例如：利润表现追踪" />
+              <label class="field-label" for="questionPayload">问题内容</label>
+              <textarea id="questionPayload" rows="6" placeholder="输入问题文本或题目 JSON"></textarea>
+              <label class="field-label" for="questionTags">标签</label>
+              <input id="questionTags" type="text" placeholder="可选：仅支持数据基本查询、数据统计分析查询、多意图、意图模糊、归因分析、开放性问题、融合查询、数据校验" />
+              <label class="field-label" for="questionNote">备注</label>
+              <textarea id="questionNote" rows="4" placeholder="备注：该问题用于论文展示或答辩演示"></textarea>
+              <div class="button-row compact-row">
+                <button id="saveQuestionButton">保存问题</button>
+                <button id="resetQuestionButton" class="secondary-button">重置表单</button>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-database" class="view-panel">
+          <div class="content-grid database-grid">
+            <article class="panel table-panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Schema</p>
+                  <h3>数据表目录</h3>
+                </div>
+              </div>
+              <div id="tableList" class="stack-list"></div>
+            </article>
+
+            <article class="panel preview-table-panel span-2">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Rows</p>
+                  <h3 id="tableTitle">选择左侧数据表后查看</h3>
+                </div>
+                <div class="button-row compact-row">
+                  <button id="prevTablePageButton" class="secondary-button">上一页</button>
+                  <button id="nextTablePageButton" class="secondary-button">下一页</button>
+                </div>
+              </div>
+              <div id="tableMeta" class="meta-line"></div>
+              <div class="table-wrap">
+                <table id="tablePreview"></table>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-evidence" class="view-panel">
+          <div class="content-grid evidence-grid">
+            <article class="panel evidence-list-panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Evidence</p>
+                  <h3>当前问题命中的 PDF 证据</h3>
+                </div>
+              </div>
+              <div id="evidenceList" class="stack-list"></div>
+            </article>
+
+            <article class="panel evidence-preview-panel span-2">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Preview</p>
+                  <h3 id="previewTitle">请先提问后预览 PDF 证据</h3>
+                </div>
+              </div>
+              <div id="previewMeta" class="meta-line"></div>
+              <div id="previewBody" class="preview-body"></div>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
+

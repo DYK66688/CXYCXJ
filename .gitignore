@@ -1,0 +1,11 @@
+﻿.venv/
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+build/
+result/
+提交文件/
+题目/
