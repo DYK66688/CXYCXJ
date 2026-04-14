@@ -13,7 +13,7 @@ from .database_base import (
     write_financial_table,
 )
 from .pdf_tools import extract_text_safe, infer_pdf_metadata
-from .utils import ensure_relative_path, normalize_stock_code, to_float
+from .utils import ensure_relative_path, normalize_report_period, normalize_stock_code, to_float
 
 
 LogFn = Callable[[str], None]
@@ -471,6 +471,43 @@ ROW_METADATA_FIELDS = {
     "serial_number",
 }
 
+PERCENTAGE_FIELDS = {
+    "net_profit_yoy_growth",
+    "operating_revenue_yoy_growth",
+    "main_business_revenue_yoy_growth",
+    "total_profit_yoy_growth",
+    "asset_total_assets_yoy_growth",
+    "liability_total_liabilities_yoy_growth",
+    "net_cash_flow_yoy_growth",
+    "asset_liability_ratio",
+    "gross_profit_margin",
+    "net_profit_margin",
+    "roe",
+    "roe_weighted_excl_non_recurring",
+    "operating_revenue_qoq_growth",
+    "net_profit_qoq_growth",
+}
+
+EPS_FIELDS = {"eps", "diluted_eps", "net_asset_per_share", "operating_cf_per_share"}
+
+AMOUNT_FIELD_LIMITS_10K: dict[str, float] = {
+    "total_operating_revenue": 100_000_000.0,
+    "main_business_revenue": 100_000_000.0,
+    "net_profit": 50_000_000.0,
+    "total_profit": 50_000_000.0,
+    "asset_total_assets": 500_000_000.0,
+    "asset_cash_and_cash_equivalents": 100_000_000.0,
+    "asset_accounts_receivable": 100_000_000.0,
+    "asset_inventory": 100_000_000.0,
+    "liability_total_liabilities": 500_000_000.0,
+    "equity_parent_net_assets": 300_000_000.0,
+    "operating_cf_net_amount": 50_000_000.0,
+    "investing_cf_net_amount": 50_000_000.0,
+    "financing_cf_net_amount": 50_000_000.0,
+}
+
+MAX_RAW_AMOUNT = 1_000_000_000_000_000.0
+
 
 def _document_priority(title: str, text: str) -> int:
     probe = re.sub(r"\s+", "", f"{title}{text[:300]}")
@@ -568,7 +605,46 @@ def _recompute_income_growths(income_rows: dict[tuple[str, str], dict[str, Any]]
 def _money_to_10k(value: float | None) -> float | None:
     if value is None:
         return None
+    if abs(value) > MAX_RAW_AMOUNT:
+        return None
     return value / 10000.0
+
+
+def _sanitize_field_value(field: str, value: Any) -> Any:
+    number = to_float(value)
+    if number is None:
+        return value
+    if field in PERCENTAGE_FIELDS or field.endswith("_growth") or field.endswith("_ratio"):
+        return None if abs(number) > 500 else number
+    if field in EPS_FIELDS:
+        return None if abs(number) > 100 else number
+    limit = AMOUNT_FIELD_LIMITS_10K.get(field)
+    if limit is not None and abs(number) > limit:
+        return None
+    return number
+
+
+def _values_conflict(existing: Any, candidate: Any) -> bool:
+    current = to_float(existing)
+    incoming = to_float(candidate)
+    if current is not None and incoming is not None:
+        return abs(current - incoming) > max(1.0, abs(current) * 0.05, abs(incoming) * 0.05)
+    return existing not in (None, "") and candidate not in (None, "") and existing != candidate
+
+
+def _record_conflict(row: dict[str, Any], field: str, existing: Any, candidate: Any, chosen_priority: int, candidate_priority: int) -> None:
+    conflicts = row.setdefault("__conflicts__", [])
+    if len(conflicts) >= 50:
+        return
+    conflicts.append(
+        {
+            "field": field,
+            "existing_value": existing,
+            "candidate_value": candidate,
+            "chosen_priority": chosen_priority,
+            "candidate_priority": candidate_priority,
+        }
+    )
 
 
 def _ensure_row(
@@ -594,6 +670,7 @@ def _ensure_row(
             "source_excerpt": source_excerpt,
             "__row_priority__": priority,
             "__field_priority__": {},
+            "__conflicts__": [],
         },
     )
     current_priority = int(row.get("__row_priority__", -1) or -1)
@@ -614,26 +691,33 @@ def _ensure_row(
     return row
 
 def _assign(row: dict[str, Any], field: str, value: Any, priority: int = 0) -> None:
+    value = _sanitize_field_value(field, value)
     if value is None:
         return
     priorities = row.setdefault("__field_priority__", {})
     current_priority = int(priorities.get(field, -1) or -1)
+    current_value = row.get(field)
+    if current_value not in (None, "") and _values_conflict(current_value, value):
+        _record_conflict(row, field, current_value, value, current_priority, priority)
     if priority < current_priority:
         return
     row[field] = value
     priorities[field] = priority
 
 def _assign_prefer_reasonable(row: dict[str, Any], field: str, value: Any, priority: int = 0) -> None:
-    candidate = to_float(value)
+    candidate = _sanitize_field_value(field, value)
+    candidate = to_float(candidate)
     if candidate is None:
         return
     priorities = row.setdefault("__field_priority__", {})
     current_priority = int(priorities.get(field, -1) or -1)
+    current = to_float(row.get(field))
+    if current is not None and _values_conflict(current, candidate):
+        _record_conflict(row, field, current, candidate, current_priority, priority)
     if priority < current_priority:
         return
-    current = to_float(row.get(field))
     if current is None or priority > current_priority or (abs(current) < 1 and abs(candidate) >= 1):
-        row[field] = value
+        row[field] = candidate
         priorities[field] = priority
 
 def _cumulative_quarter_values(values: list[float | None]) -> list[float | None]:
@@ -862,11 +946,340 @@ def _apply_profit_statement_total_profit(
         _assign(current_row, "total_profit_yoy_growth", _recompute_growth(current_value, previous_value), priority=priority)
 
 
+def _document_priority_v2(title: str, text: str) -> int:
+    probe = re.sub(r"\s+", "", f"{title}{text[:400]}")
+    priority = 0
+    if any(keyword in probe for keyword in ("年度报告", "半年度报告", "季度报告", "一季度报告", "三季度报告")):
+        priority += 10
+    if "摘要" in probe:
+        priority -= 5
+    if any(keyword in probe for keyword in ("修订版", "更正版", "更新后")):
+        priority += 2
+    return priority
+
+
+def _collect_conflicts_v2(table: str, rows: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    for (stock_code, report_period), row in rows.items():
+        for item in row.get("__conflicts__", []):
+            conflicts.append(
+                {
+                    "table": table,
+                    "stock_code": stock_code,
+                    "report_period": report_period,
+                    **item,
+                }
+            )
+    return conflicts
+
+
+def _apply_annual_quarter_breakdown_v2(
+    text: str,
+    stock_code: str,
+    stock_abbr: str,
+    report_period: str,
+    report_date: str,
+    source_file: str,
+    income_rows: dict[tuple[str, str], dict[str, Any]],
+    cash_rows: dict[tuple[str, str], dict[str, Any]],
+    priority: int = 0,
+) -> None:
+    anchors = ["分季度主要财务指标", "报告期分季度的主要会计数据", "分季度主要财务数据"]
+    if not _find_first_label(text, anchors):
+        return
+    year = int(report_period[:4])
+    section = _section_after_anchor(text, anchors)
+    period_labels = [f"{year}Q1", f"{year}HY", f"{year}Q3", f"{year}FY"]
+
+    def _assign_quarter_series(
+        store: dict[tuple[str, str], dict[str, Any]],
+        labels: list[str],
+        field: str,
+        source_excerpt: str,
+    ) -> None:
+        values = _parse_quarterly_breakdown_tokens(_tokens_after_labels(section, labels, 420, 12, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+        cumulative_values = _cumulative_quarter_values(values)
+        fy_candidate = _money_to_10k(cumulative_values[-1])
+        fy_row = store.get((stock_code, report_period))
+        if fy_row is not None and fy_candidate is not None:
+            existing = to_float(fy_row.get(field))
+            if existing is not None and _values_conflict(existing, fy_candidate):
+                _record_conflict(
+                    fy_row,
+                    field,
+                    existing,
+                    fy_candidate,
+                    int(fy_row.get("__field_priority__", {}).get(field, -1) or -1),
+                    priority,
+                )
+                return
+        for period, value in zip(period_labels, cumulative_values, strict=False):
+            if value is None:
+                continue
+            row = _ensure_row(
+                store,
+                stock_code,
+                stock_abbr,
+                period,
+                report_date,
+                source_file,
+                source_excerpt,
+                priority=priority,
+            )
+            _assign_prefer_reasonable(row, field, _money_to_10k(value), priority=priority)
+
+    _assign_quarter_series(
+        income_rows,
+        ["营业总收入", "营业收入"],
+        "total_operating_revenue",
+        "年度分季度数据-营业总收入",
+    )
+    _assign_quarter_series(
+        income_rows,
+        ["主营业务收入", "营业总收入", "营业收入"],
+        "main_business_revenue",
+        "年度分季度数据-主营业务收入",
+    )
+    _assign_quarter_series(
+        income_rows,
+        ["归属于上市公司股东的净利润", "归属于母公司股东的净利润", "归属于母公司所有者的净利润"],
+        "net_profit",
+        "年度分季度数据-净利润",
+    )
+    _assign_quarter_series(
+        cash_rows,
+        ["经营活动产生的现金流量净额"],
+        "operating_cf_net_amount",
+        "年度分季度数据-经营活动现金流量净额",
+    )
+
+
+def _apply_annual_key_data_v2(
+    text: str,
+    stock_code: str,
+    stock_abbr: str,
+    report_period: str,
+    report_date: str,
+    source_file: str,
+    income_rows: dict[tuple[str, str], dict[str, Any]],
+    kpi_rows: dict[tuple[str, str], dict[str, Any]],
+    balance_rows: dict[tuple[str, str], dict[str, Any]],
+    cash_rows: dict[tuple[str, str], dict[str, Any]],
+    priority: int = 0,
+) -> None:
+    if not report_period.endswith("FY"):
+        return
+    section = _section_after_anchor(text, ["近三年主要会计数据和财务指标", "主要会计数据和财务指标", "主要财务数据"])
+
+    current_income = _ensure_row(income_rows, stock_code, stock_abbr, report_period, report_date, source_file, "年度主要会计数据和财务指标", priority=priority)
+    current_cash = _ensure_row(cash_rows, stock_code, stock_abbr, report_period, report_date, source_file, "年度主要会计数据和财务指标", priority=priority)
+    current_kpi = _ensure_row(kpi_rows, stock_code, stock_abbr, report_period, report_date, source_file, "年度主要会计数据和财务指标", priority=priority)
+    current_balance = _ensure_row(balance_rows, stock_code, stock_abbr, report_period, report_date, source_file, "年度主要会计数据和财务指标", priority=priority)
+
+    revenue = _parse_annual_row_tokens(_tokens_after_labels(section, ["营业总收入", "营业收入"], 360, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    revenue_current = _money_to_10k(revenue.get("current"))
+    _assign(current_income, "total_operating_revenue", revenue_current, priority=priority)
+    _assign(current_income, "main_business_revenue", revenue_current, priority=priority)
+    revenue_yoy = revenue.get("yoy") if revenue.get("yoy") is not None else _recompute_growth(revenue.get("current"), revenue.get("previous"))
+    _assign(current_income, "operating_revenue_yoy_growth", revenue_yoy, priority=priority)
+    _assign(current_income, "main_business_revenue_yoy_growth", revenue_yoy, priority=priority)
+
+    total_profit = _parse_annual_row_tokens(_tokens_after_labels(section, ["利润总额"], 320, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_income, "total_profit", _money_to_10k(total_profit.get("current")), priority=priority)
+    total_profit_yoy = total_profit.get("yoy") if total_profit.get("yoy") is not None else _recompute_growth(total_profit.get("current"), total_profit.get("previous"))
+    _assign(current_income, "total_profit_yoy_growth", total_profit_yoy, priority=priority)
+
+    net_profit = _parse_annual_row_tokens(
+        _tokens_after_labels(section, ["归属于上市公司股东的净利润", "归属于母公司股东的净利润", "归属于母公司所有者的净利润"], 360, stop_labels=FINANCIAL_ROW_STOP_LABELS)
+    )
+    _assign(current_income, "net_profit", _money_to_10k(net_profit.get("current")), priority=priority)
+    net_profit_yoy = net_profit.get("yoy") if net_profit.get("yoy") is not None else _recompute_growth(net_profit.get("current"), net_profit.get("previous"))
+    _assign(current_income, "net_profit_yoy_growth", net_profit_yoy, priority=priority)
+
+    operating_cash = _parse_annual_row_tokens(_tokens_after_labels(section, ["经营活动产生的现金流量净额"], 320, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_cash, "operating_cf_net_amount", _money_to_10k(operating_cash.get("current")), priority=priority)
+
+    investing_cash = _parse_annual_row_tokens(_tokens_after_labels(section, ["投资活动产生的现金流量净额"], 320, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_cash, "investing_cf_net_amount", _money_to_10k(investing_cash.get("current")), priority=priority)
+
+    financing_cash = _parse_annual_row_tokens(_tokens_after_labels(section, ["筹资活动产生的现金流量净额"], 320, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_cash, "financing_cf_net_amount", _money_to_10k(financing_cash.get("current")), priority=priority)
+
+    eps_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["基本每股收益", "每股收益"], 220, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_kpi, "eps", eps_values.get("current"), priority=priority)
+
+    diluted_eps_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["稀释每股收益"], 220, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_kpi, "diluted_eps", diluted_eps_values.get("current"), priority=priority)
+
+    roe_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["加权平均净资产收益率", "净资产收益率"], 220, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_kpi, "roe", roe_values.get("current"), priority=priority)
+
+    roe_ex_values = _parse_annual_row_tokens(
+        _tokens_after_labels(section, ["扣除非经常性损益后的加权平均净资产收益率", "加权平均净资产收益率（扣非）", "加权平均净资产收益率(扣非)"], 240, stop_labels=FINANCIAL_ROW_STOP_LABELS)
+    )
+    _assign(current_kpi, "roe_weighted_excl_non_recurring", roe_ex_values.get("current"), priority=priority)
+
+    asset_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["总资产"], 260, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_balance, "asset_total_assets", _money_to_10k(asset_values.get("current")), priority=priority)
+    asset_yoy = asset_values.get("yoy") if asset_values.get("yoy") is not None else _recompute_growth(asset_values.get("current"), asset_values.get("previous"))
+    _assign(current_balance, "asset_total_assets_yoy_growth", asset_yoy, priority=priority)
+
+    cash_balance_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["货币资金"], 240, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_balance, "asset_cash_and_cash_equivalents", _money_to_10k(cash_balance_values.get("current")), priority=priority)
+
+    receivable_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["应收账款"], 240, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_balance, "asset_accounts_receivable", _money_to_10k(receivable_values.get("current")), priority=priority)
+
+    inventory_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["存货"], 240, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_balance, "asset_inventory", _money_to_10k(inventory_values.get("current")), priority=priority)
+
+    liability_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["总负债", "负债总额"], 260, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_balance, "liability_total_liabilities", _money_to_10k(liability_values.get("current")), priority=priority)
+    liability_yoy = liability_values.get("yoy") if liability_values.get("yoy") is not None else _recompute_growth(liability_values.get("current"), liability_values.get("previous"))
+    _assign(current_balance, "liability_total_liabilities_yoy_growth", liability_yoy, priority=priority)
+
+    ratio_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["资产负债率"], 200, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(current_balance, "asset_liability_ratio", ratio_values.get("current"), priority=priority)
+
+    parent_equity_values = _parse_annual_row_tokens(
+        _tokens_after_labels(section, ["归属于上市公司股东的净资产", "归属于母公司股东的净资产", "归属于母公司所有者权益"], 280, stop_labels=FINANCIAL_ROW_STOP_LABELS)
+    )
+    _assign(current_balance, "equity_parent_net_assets", _money_to_10k(parent_equity_values.get("current")), priority=priority)
+
+    _apply_annual_quarter_breakdown_v2(
+        text,
+        stock_code,
+        stock_abbr,
+        report_period,
+        report_date,
+        source_file,
+        income_rows,
+        cash_rows,
+        priority=max(0, priority - 20),
+    )
+
+
+def _apply_periodic_key_data_v2(
+    text: str,
+    stock_code: str,
+    stock_abbr: str,
+    report_period: str,
+    report_date: str,
+    source_file: str,
+    income_rows: dict[tuple[str, str], dict[str, Any]],
+    kpi_rows: dict[tuple[str, str], dict[str, Any]],
+    balance_rows: dict[tuple[str, str], dict[str, Any]],
+    cash_rows: dict[tuple[str, str], dict[str, Any]],
+    priority: int = 0,
+) -> None:
+    section = _section_after_anchor(text, ["主要财务数据", "主要会计数据和财务指标"])
+    income_row = _ensure_row(income_rows, stock_code, stock_abbr, report_period, report_date, source_file, "季度主要会计数据和财务指标", priority=priority)
+    cash_row = _ensure_row(cash_rows, stock_code, stock_abbr, report_period, report_date, source_file, "季度主要会计数据和财务指标", priority=priority)
+    kpi_row = _ensure_row(kpi_rows, stock_code, stock_abbr, report_period, report_date, source_file, "季度主要会计数据和财务指标", priority=priority)
+    balance_row = _ensure_row(balance_rows, stock_code, stock_abbr, report_period, report_date, source_file, "季度主要会计数据和财务指标", priority=priority)
+
+    revenue = _parse_periodic_row_tokens(_tokens_after_labels(section, ["营业总收入", "营业收入"], 320, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(income_row, "total_operating_revenue", _money_to_10k(_period_metric_value(report_period, revenue)), priority=priority)
+    _assign(income_row, "main_business_revenue", _money_to_10k(_period_metric_value(report_period, revenue)), priority=priority)
+    _assign(income_row, "operating_revenue_yoy_growth", _period_metric_growth(report_period, revenue), priority=priority)
+    _assign(income_row, "main_business_revenue_yoy_growth", _period_metric_growth(report_period, revenue), priority=priority)
+
+    total_profit = _parse_periodic_row_tokens(_tokens_after_labels(section, ["利润总额"], 280, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(income_row, "total_profit", _money_to_10k(_period_metric_value(report_period, total_profit)), priority=priority)
+    _assign(income_row, "total_profit_yoy_growth", _period_metric_growth(report_period, total_profit), priority=priority)
+
+    net_profit = _parse_periodic_row_tokens(
+        _tokens_after_labels(section, ["归属于上市公司股东的净利润", "归属于母公司股东的净利润", "归属于母公司所有者的净利润"], 320, stop_labels=FINANCIAL_ROW_STOP_LABELS)
+    )
+    _assign(income_row, "net_profit", _money_to_10k(_period_metric_value(report_period, net_profit)), priority=priority)
+    _assign(income_row, "net_profit_yoy_growth", _period_metric_growth(report_period, net_profit), priority=priority)
+
+    operating_cash = _parse_periodic_row_tokens(_tokens_after_labels(section, ["经营活动产生的现金流量净额"], 280, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(cash_row, "operating_cf_net_amount", _money_to_10k(_period_metric_value(report_period, operating_cash)), priority=priority)
+
+    investing_cash = _parse_periodic_row_tokens(_tokens_after_labels(section, ["投资活动产生的现金流量净额"], 280, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(cash_row, "investing_cf_net_amount", _money_to_10k(_period_metric_value(report_period, investing_cash)), priority=priority)
+
+    financing_cash = _parse_periodic_row_tokens(_tokens_after_labels(section, ["筹资活动产生的现金流量净额"], 280, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(cash_row, "financing_cf_net_amount", _money_to_10k(_period_metric_value(report_period, financing_cash)), priority=priority)
+
+    eps_values = _parse_periodic_row_tokens(_tokens_after_labels(section, ["基本每股收益", "每股收益"], 220, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(kpi_row, "eps", _period_metric_value(report_period, eps_values), priority=priority)
+
+    diluted_eps_values = _parse_periodic_row_tokens(_tokens_after_labels(section, ["稀释每股收益"], 220, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(kpi_row, "diluted_eps", _period_metric_value(report_period, diluted_eps_values), priority=priority)
+
+    roe_values = _parse_periodic_row_tokens(_tokens_after_labels(section, ["加权平均净资产收益率", "净资产收益率"], 220, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(kpi_row, "roe", _period_metric_value(report_period, roe_values), priority=priority)
+
+    asset_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["总资产"], 240, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(balance_row, "asset_total_assets", _money_to_10k(asset_values.get("current")), priority=priority)
+
+    cash_balance_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["货币资金"], 220, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(balance_row, "asset_cash_and_cash_equivalents", _money_to_10k(cash_balance_values.get("current")), priority=priority)
+
+    receivable_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["应收账款"], 220, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(balance_row, "asset_accounts_receivable", _money_to_10k(receivable_values.get("current")), priority=priority)
+
+    inventory_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["存货"], 220, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(balance_row, "asset_inventory", _money_to_10k(inventory_values.get("current")), priority=priority)
+
+    parent_equity_values = _parse_annual_row_tokens(
+        _tokens_after_labels(section, ["归属于上市公司股东的净资产", "归属于母公司股东的净资产", "归属于母公司所有者权益"], 260, stop_labels=FINANCIAL_ROW_STOP_LABELS)
+    )
+    _assign(balance_row, "equity_parent_net_assets", _money_to_10k(parent_equity_values.get("current")), priority=priority)
+
+    ratio_values = _parse_annual_row_tokens(_tokens_after_labels(section, ["资产负债率"], 180, stop_labels=FINANCIAL_ROW_STOP_LABELS))
+    _assign(balance_row, "asset_liability_ratio", ratio_values.get("current"), priority=priority)
+
+
+def _apply_profit_statement_total_profit_v2(
+    text: str,
+    stock_code: str,
+    stock_abbr: str,
+    report_period: str,
+    report_date: str,
+    source_file: str,
+    income_rows: dict[tuple[str, str], dict[str, Any]],
+    priority: int = 0,
+) -> None:
+    anchors = ["合并利润表", "合并年初到报告期末利润表"]
+    if not _find_first_label(text, anchors):
+        return
+    section = _section_after_anchor(text, anchors)
+    tokens = _tokens_after_labels(
+        section,
+        ["四、利润总额", "利润总额"],
+        240,
+        6,
+        stop_labels=PROFIT_STATEMENT_STOP_LABELS,
+    )
+    values = [to_float(token.rstrip("%")) for token in tokens if token]
+    values = [value for value in values if value is not None]
+    if not values:
+        return
+    current_row = _ensure_row(
+        income_rows,
+        stock_code,
+        stock_abbr,
+        report_period,
+        report_date,
+        source_file,
+        "利润表正文-利润总额",
+        priority=priority,
+    )
+    current_value = _money_to_10k(values[0])
+    _assign(current_row, "total_profit", current_value, priority=priority)
+    if len(values) >= 2:
+        previous_value = _money_to_10k(values[1])
+        _assign(current_row, "total_profit_yoy_growth", _recompute_growth(current_value, previous_value), priority=priority)
+
+
 def _should_extract_report(path: Path) -> bool:
     return path.stat().st_size <= 25_000_000
 
 
-def load_financial_reports(database: Database, config: AppConfig, log: LogFn | None = None) -> None:
+def load_financial_reports(database: Database, config: AppConfig, log: LogFn | None = None) -> dict[str, Any]:
     company_rows = {
         row["stock_code"]: dict(row)
         for row in database.query("SELECT stock_code, stock_abbr, company_name FROM company_info ORDER BY stock_code")
@@ -897,7 +1310,7 @@ def load_financial_reports(database: Database, config: AppConfig, log: LogFn | N
         metadata = infer_pdf_metadata(pdf_path, text)
         stock_code = normalize_stock_code(metadata.get("stock_code", ""))
         stock_name = metadata.get("stock_name", "")
-        report_period = metadata.get("report_period", "")
+        report_period = normalize_report_period(metadata.get("report_period", ""))
         report_date = metadata.get("report_date", "")
 
         company = company_rows.get(stock_code) if stock_code else None
@@ -951,9 +1364,9 @@ def load_financial_reports(database: Database, config: AppConfig, log: LogFn | N
         if not stock_code or not report_period or text == pdf_path.stem:
             continue
 
-        document_priority = _document_priority(str(metadata.get("title", pdf_path.stem)), text)
+        document_priority = _document_priority_v2(str(metadata.get("title", pdf_path.stem)), text)
         if report_period.endswith("FY"):
-            _apply_annual_key_data(
+            _apply_annual_key_data_v2(
                 text,
                 stock_code,
                 stock_abbr,
@@ -967,7 +1380,7 @@ def load_financial_reports(database: Database, config: AppConfig, log: LogFn | N
                 priority=document_priority + 20,
             )
         else:
-            _apply_periodic_key_data(
+            _apply_periodic_key_data_v2(
                 text,
                 stock_code,
                 stock_abbr,
@@ -976,10 +1389,11 @@ def load_financial_reports(database: Database, config: AppConfig, log: LogFn | N
                 relative_path,
                 income_rows,
                 kpi_rows,
+                balance_rows,
                 cash_rows,
                 priority=document_priority + 30,
             )
-        _apply_profit_statement_total_profit(
+        _apply_profit_statement_total_profit_v2(
             text,
             stock_code,
             stock_abbr,
@@ -999,12 +1413,30 @@ def load_financial_reports(database: Database, config: AppConfig, log: LogFn | N
     write_financial_table(database, "core_performance_indicators_sheet", kpi_rows)
     write_financial_table(database, "balance_sheet", balance_rows)
     write_financial_table(database, "cash_flow_sheet", cash_rows)
+    extraction_report = {
+        "source_priority_rule": ["利润表正文", "主要会计数据和财务指标", "分季度拆解"],
+        "conflicts": (
+            _collect_conflicts_v2("income_sheet", income_rows)
+            + _collect_conflicts_v2("core_performance_indicators_sheet", kpi_rows)
+            + _collect_conflicts_v2("balance_sheet", balance_rows)
+            + _collect_conflicts_v2("cash_flow_sheet", cash_rows)
+        )[:200],
+        "coverage": {
+            "income_sheet": len(income_rows),
+            "core_performance_indicators_sheet": len(kpi_rows),
+            "balance_sheet": len(balance_rows),
+            "cash_flow_sheet": len(cash_rows),
+        },
+    }
     if log is not None:
         log(
             "财报 PDF 解析完成："
             f"收入表 {len(income_rows)} 行，核心指标表 {len(kpi_rows)} 行，"
             f"资产负债表 {len(balance_rows)} 行，现金流量表 {len(cash_rows)} 行"
         )
+
+    return extraction_report
+
 
 def load_research_pdf_chunks(database: Database, config: AppConfig, log: LogFn | None = None) -> None:
     stock_meta = {row["title"]: dict(row) for row in database.query("SELECT * FROM stock_research")}

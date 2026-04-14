@@ -15,14 +15,17 @@ from financial_qa_assistant.config import AppConfig
 from financial_qa_assistant.database import _write_ingest_report, database_status
 from financial_qa_assistant.database_extract import (
     _apply_annual_key_data,
+    _apply_annual_key_data_v2,
     _apply_profit_statement_total_profit,
     _filter_rows_for_allowed_periods,
     _parse_annual_row_tokens,
     _parse_periodic_row_tokens,
 )
-from financial_qa_assistant.database_base import Database, create_base_tables
+from financial_qa_assistant.database_base import Database, create_base_tables, create_financial_tables
+from financial_qa_assistant.pdf_tools import _clean_extracted_text
 from financial_qa_assistant.question_bank import ALLOWED_QUESTION_TAGS, build_question_bank_payload
-from financial_qa_assistant.utils import parse_period, parse_question_payload, sortable_period
+from financial_qa_assistant.utils import FACT_METRIC_SPECS, get_standard_metric_label, normalize_report_period, parse_period, parse_question_payload, sortable_period
+from financial_qa_assistant.web import RebuildMutex, _guard_rebuild_request
 from financial_qa_assistant.xlsx_tools import read_workbook, write_simple_xlsx
 
 
@@ -99,7 +102,7 @@ class BasicTests(unittest.TestCase):
         self.assertEqual("SELECT 1", rows[1][2])
         self.assertEqual("折线图", rows[1][3])
         self.assertIn('"content": "第一答"', rows[1][4])
-        self.assertIn('result/B1001_1.jpg', rows[1][4])
+        self.assertIn('./result/B1001_1.jpg', rows[1][4])
         self.assertNotIn('"sql"', rows[1][4])
         self.assertNotIn('"references"', rows[1][4])
         self.assertTrue(copied_image.exists())
@@ -153,7 +156,7 @@ class BasicTests(unittest.TestCase):
         self.assertEqual("B2001", rows[1][0])
         self.assertEqual("SELECT 1", rows[1][2])
         self.assertIn('"content": "第一答"', rows[1][3])
-        self.assertIn('result/B2001_1.jpg', rows[1][3])
+        self.assertIn('./result/B2001_1.jpg', rows[1][3])
         self.assertIn('"references": [', rows[1][3])
         self.assertIn('"paper_path": "sample/report.pdf"', rows[1][3])
         self.assertIn('"text": "证据片段"', rows[1][3])
@@ -538,6 +541,292 @@ class BasicTests(unittest.TestCase):
             report_path.unlink(missing_ok=True)
         else:
             report_path.write_text(original, encoding="utf-8")
+
+    def test_rebuild_guard_blocks_ask_route(self) -> None:
+        mutex = RebuildMutex()
+        self.assertTrue(mutex.begin())
+        blocked = _guard_rebuild_request("/api/ask", mutex)
+        mutex.finish()
+
+        self.assertIsNotNone(blocked)
+        payload, _status = blocked
+        self.assertEqual("rebuild_in_progress", payload["code"])
+        self.assertIn("提问", payload["message"])
+
+    def test_standard_metric_labels_are_clean_chinese(self) -> None:
+        self.assertEqual("净利润", get_standard_metric_label("income_sheet", "net_profit"))
+        self.assertEqual("归母净资产", get_standard_metric_label("balance_sheet", "equity_parent_net_assets"))
+        self.assertEqual("稀释每股收益", get_standard_metric_label("core_performance_indicators_sheet", "diluted_eps"))
+        self.assertIn(("equity_parent_net_assets", "归母净资产", None), FACT_METRIC_SPECS["balance_sheet"])
+
+    def test_report_period_normalization_is_deterministic(self) -> None:
+        self.assertEqual("2024FY", normalize_report_period("2024年年度"))
+        self.assertEqual("2024HY", normalize_report_period("2024年半年度"))
+        self.assertEqual("2024Q3", normalize_report_period("2024年第三季度"))
+
+    def test_financial_tables_include_required_extension_columns(self) -> None:
+        config = AppConfig.discover(WORKSPACE)
+        db_path = WORKSPACE / "build" / "test_extended_financial_columns.sqlite3"
+        db_path.unlink(missing_ok=True)
+        database = Database(db_path)
+        create_base_tables(database)
+        create_financial_tables(database, config.schema_file())
+
+        self.assertTrue(database.has_column("balance_sheet", "equity_parent_net_assets"))
+        self.assertTrue(database.has_column("core_performance_indicators_sheet", "diluted_eps"))
+
+        db_path.unlink(missing_ok=True)
+
+    def test_pdf_cleaning_splits_glued_numbers(self) -> None:
+        cleaned = _clean_extracted_text("营业收入585,461,786.232024年主要会计数据")
+        self.assertIn("585,461,786.23 2024年", cleaned)
+
+    def test_annual_key_data_v2_populates_required_core_fields(self) -> None:
+        income_rows: dict[tuple[str, str], dict[str, object]] = {}
+        kpi_rows: dict[tuple[str, str], dict[str, object]] = {}
+        balance_rows: dict[tuple[str, str], dict[str, object]] = {}
+        cash_rows: dict[tuple[str, str], dict[str, object]] = {}
+        text = (
+            "主要会计数据和财务指标 "
+            "营业总收入 585,461,786.23 565,403,410.11 3.55 579,374,501.21 "
+            "利润总额 104,611,329.88 82,890,580.25 26.20 73,459,505.16 "
+            "归属于上市公司股东的净利润 74,611,329.88 42,890,580.25 73.96 33,459,505.16 "
+            "经营活动产生的现金流量净额 41,728,335.16 46,322,344.18 -9.92 46,362,635.96 "
+            "投资活动产生的现金流量净额 -123,456,789.00 -110,000,000.00 不适用 -100,000,000.00 "
+            "筹资活动产生的现金流量净额 88,000,000.00 66,000,000.00 33.33 55,000,000.00 "
+            "基本每股收益 0.1364 -0.0784 不适用 0.0612 "
+            "稀释每股收益 0.1301 -0.0700 不适用 0.0500 "
+            "加权平均净资产收益率 8.12 6.22 1.90 5.88 "
+            "总资产 2,151,989,341.37 2,067,584,032.87 4.08 2,183,773,341.36 "
+            "货币资金 505,000,000.00 480,000,000.00 5.21 470,000,000.00 "
+            "应收账款 188,000,000.00 175,000,000.00 7.43 166,000,000.00 "
+            "存货 260,000,000.00 250,000,000.00 4.00 240,000,000.00 "
+            "总负债 700,000,000.00 680,000,000.00 2.94 650,000,000.00 "
+            "资产负债率 42.15 40.01 2.14 39.20 "
+            "归属于上市公司股东的净资产 1,234,567,890.12 1,111,111,111.11 11.11 1,000,000,000.00"
+        )
+
+        _apply_annual_key_data_v2(
+            text=text,
+            stock_code="600080",
+            stock_abbr="Ginwa",
+            report_period="2024FY",
+            report_date="2025-04-25",
+            source_file="annual.pdf",
+            income_rows=income_rows,
+            kpi_rows=kpi_rows,
+            balance_rows=balance_rows,
+            cash_rows=cash_rows,
+            priority=100,
+        )
+
+        income_row = income_rows[("600080", "2024FY")]
+        kpi_row = kpi_rows[("600080", "2024FY")]
+        balance_row = balance_rows[("600080", "2024FY")]
+        cash_row = cash_rows[("600080", "2024FY")]
+
+        self.assertIsNotNone(income_row["total_operating_revenue"])
+        self.assertIsNotNone(income_row["net_profit"])
+        self.assertIsNotNone(income_row["total_profit"])
+        self.assertIsNotNone(kpi_row["eps"])
+        self.assertIsNotNone(kpi_row["diluted_eps"])
+        self.assertIsNotNone(kpi_row["roe"])
+        self.assertIsNotNone(balance_row["asset_total_assets"])
+        self.assertIsNotNone(balance_row["asset_cash_and_cash_equivalents"])
+        self.assertIsNotNone(balance_row["asset_accounts_receivable"])
+        self.assertIsNotNone(balance_row["asset_inventory"])
+        self.assertIsNotNone(balance_row["equity_parent_net_assets"])
+        self.assertIsNotNone(cash_row["operating_cf_net_amount"])
+        self.assertIsNotNone(cash_row["investing_cf_net_amount"])
+        self.assertIsNotNone(cash_row["financing_cf_net_amount"])
+
+
+class AssistantPlanningTests(unittest.TestCase):
+    def _build_engine(self, name: str) -> tuple[FinancialQAEngine, Database, Path]:
+        config = AppConfig.discover(WORKSPACE)
+        db_path = WORKSPACE / "build" / name
+        db_path.unlink(missing_ok=True)
+        self.addCleanup(db_path.unlink, missing_ok=True)
+        database = Database(db_path)
+        create_base_tables(database)
+        create_financial_tables(database, config.schema_file())
+        engine = FinancialQAEngine(config, database)
+        return engine, database, db_path
+
+    def _seed_company(self, database: Database, stock_code: str, stock_abbr: str, company_name: str) -> None:
+        database.execute(
+            """
+            INSERT INTO company_info (
+                serial_number, stock_code, stock_abbr, company_name, english_name,
+                industry, listed_exchange, security_type, registered_region,
+                registered_capital, employee_count, management_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, stock_code, stock_abbr, company_name, "", "中药", "深交所", "A股", "深圳", "", "10000", "200"),
+        )
+
+    def _seed_income(
+        self,
+        database: Database,
+        stock_code: str,
+        stock_abbr: str,
+        report_period: str,
+        report_date: str,
+        net_profit: float,
+        total_profit: float,
+        revenue: float,
+        revenue_yoy: float,
+    ) -> None:
+        database.execute(
+            """
+            INSERT INTO income_sheet (
+                stock_code, stock_abbr, report_period, report_date,
+                net_profit, total_profit,
+                total_operating_revenue, operating_revenue_yoy_growth,
+                main_business_revenue, main_business_revenue_yoy_growth
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (stock_code, stock_abbr, report_period, report_date, net_profit, total_profit, revenue, revenue_yoy, revenue, revenue_yoy),
+        )
+
+    def _seed_document_chunk(
+        self,
+        database: Database,
+        *,
+        source_type: str,
+        title: str,
+        stock_code: str,
+        stock_name: str,
+        report_period: str,
+        file_path: str,
+        chunk_index: int,
+        text: str,
+    ) -> None:
+        database.execute(
+            """
+            INSERT INTO document_chunks (
+                source_type, title, stock_code, stock_name, report_period, file_path, chunk_index, text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (source_type, title, stock_code, stock_name, report_period, file_path, chunk_index, text),
+        )
+
+    def test_company_missing_returns_clarification(self) -> None:
+        engine, _database, _db_path = self._build_engine("test_planning_missing_company.sqlite3")
+
+        answer = engine.answer_question("净利润是多少", {})
+
+        self.assertIn("先确定公司名称", answer.content)
+
+    def test_period_missing_returns_clarification(self) -> None:
+        engine, database, _db_path = self._build_engine("test_planning_missing_period.sqlite3")
+        self._seed_company(database, "000999", "华润三九", "华润三九医药股份有限公司")
+        self._seed_income(database, "000999", "华润三九", "2023FY", "2024-03-20", 80.0, 90.0, 500.0, 8.0)
+        self._seed_income(database, "000999", "华润三九", "2024FY", "2025-03-20", 100.0, 120.0, 560.0, 12.0)
+        engine.refresh()
+
+        answer = engine.answer_question("华润三九的净利润是多少", {})
+
+        self.assertIn("哪个报告期", answer.content)
+        self.assertIn("2023FY", answer.content)
+        self.assertIn("2024FY", answer.content)
+
+    def test_company_without_metric_returns_metric_clarification(self) -> None:
+        engine, database, _db_path = self._build_engine("test_planning_missing_metric.sqlite3")
+        self._seed_company(database, "000999", "华润三九", "华润三九医药股份有限公司")
+        engine.refresh()
+
+        answer = engine.answer_question("华润三九的数据", {})
+
+        self.assertIn("缺少具体指标", answer.content)
+
+    def test_multi_turn_context_reuses_company_and_metric(self) -> None:
+        engine, database, _db_path = self._build_engine("test_planning_context_reuse.sqlite3")
+        self._seed_company(database, "000999", "华润三九", "华润三九医药股份有限公司")
+        self._seed_income(database, "000999", "华润三九", "2023FY", "2024-03-20", 80.0, 90.0, 500.0, 8.0)
+        self._seed_income(database, "000999", "华润三九", "2024FY", "2025-03-20", 100.0, 120.0, 560.0, 12.0)
+        self._seed_document_chunk(
+            database,
+            source_type="stock_research_pdf",
+            title="华润三九：渠道恢复推动收入增长",
+            stock_code="000999",
+            stock_name="华润三九",
+            report_period="2024FY",
+            file_path="reports/sample.pdf",
+            chunk_index=1,
+            text="渠道恢复和品牌力提升共同推动主营业务收入增长，CHC业务持续回暖。",
+        )
+        engine.refresh()
+        context: dict[str, object] = {}
+
+        first_answer = engine.answer_question("华润三九2024年的主营业务收入是多少", context)
+        second_answer = engine.answer_question("那上升的原因是什么", context)
+
+        self.assertIn("主营业务收入", first_answer.content)
+        self.assertNotIn("缺少公司名称", second_answer.content)
+        self.assertIn("证据依据", second_answer.content)
+        self.assertTrue(second_answer.references)
+
+    def test_explicit_new_context_overrides_previous_round(self) -> None:
+        engine, database, _db_path = self._build_engine("test_planning_context_override.sqlite3")
+        self._seed_company(database, "000999", "华润三九", "华润三九医药股份有限公司")
+        self._seed_company(database, "002603", "以岭药业", "石家庄以岭药业股份有限公司")
+        self._seed_income(database, "000999", "华润三九", "2024FY", "2025-03-20", 100.0, 120.0, 560.0, 12.0)
+        self._seed_income(database, "002603", "以岭药业", "2024FY", "2025-03-20", 55.0, 70.0, 330.0, 8.0)
+        engine.refresh()
+        context: dict[str, object] = {}
+
+        engine.answer_question("华润三九2024年的净利润是多少", context)
+        answer = engine.answer_question("那以岭药业2024年的净利润呢", context)
+
+        self.assertIn("以岭药业", answer.content)
+        self.assertIn("2024年年度", answer.content)
+        self.assertNotIn("华润三九2024年年度的净利润", answer.content)
+
+    def test_multi_intent_ranking_yoy_max_is_assembled(self) -> None:
+        engine, database, _db_path = self._build_engine("test_planning_multi_intent.sqlite3")
+        self._seed_company(database, "000001", "甲公司", "甲公司股份有限公司")
+        self._seed_company(database, "000002", "乙公司", "乙公司股份有限公司")
+        self._seed_company(database, "000003", "丙公司", "丙公司股份有限公司")
+        self._seed_income(database, "000001", "甲公司", "2023FY", "2024-03-20", 70.0, 90.0, 400.0, 10.0)
+        self._seed_income(database, "000001", "甲公司", "2024FY", "2025-03-20", 90.0, 120.0, 480.0, 20.0)
+        self._seed_income(database, "000002", "乙公司", "2023FY", "2024-03-20", 50.0, 60.0, 350.0, 5.0)
+        self._seed_income(database, "000002", "乙公司", "2024FY", "2025-03-20", 85.0, 110.0, 360.0, 6.0)
+        self._seed_income(database, "000003", "丙公司", "2023FY", "2024-03-20", 40.0, 55.0, 300.0, 4.0)
+        self._seed_income(database, "000003", "丙公司", "2024FY", "2025-03-20", 60.0, 70.0, 330.0, 8.0)
+        engine.refresh()
+
+        answer = engine.answer_question("2024年利润最高的top2企业中，谁的利润同比增幅最大？", {})
+
+        self.assertIn("Top2", answer.content)
+        self.assertIn("利润同比增幅最高的是", answer.content)
+        self.assertIn("1. ", answer.content)
+
+    def test_task3_attribution_outputs_clean_references(self) -> None:
+        engine, database, _db_path = self._build_engine("test_planning_task3_refs.sqlite3")
+        self._seed_company(database, "000999", "华润三九", "华润三九医药股份有限公司")
+        self._seed_income(database, "000999", "华润三九", "2023FY", "2024-03-20", 80.0, 90.0, 500.0, 8.0)
+        self._seed_income(database, "000999", "华润三九", "2024FY", "2025-03-20", 100.0, 120.0, 560.0, 12.0)
+        self._seed_document_chunk(
+            database,
+            source_type="stock_research_pdf",
+            title="华润三九：主业恢复增长",
+            stock_code="000999",
+            stock_name="华润三九",
+            report_period="2024FY",
+            file_path="reports/sample.pdf",
+            chunk_index=1,
+            text="渠道恢复、新品放量和品牌力提升共同推动主营业务收入增长，零售端表现改善。",
+        )
+        engine.refresh()
+
+        answer = engine.answer_question("华润三九主营业务收入上升的原因是什么", {})
+
+        self.assertTrue(answer.references)
+        self.assertIn("从结构化数据库看", answer.content)
+        self.assertIn("证据依据", answer.content)
+        self.assertLessEqual(len(answer.references), 3)
+        self.assertTrue(all(reference["text"] for reference in answer.references))
 
 if __name__ == "__main__":
     unittest.main()

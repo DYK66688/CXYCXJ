@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from .assistant import FinancialQAEngine
+from .planner import plan_subtasks
 from .utils import METRIC_ALIASES, normalize_text, parse_question_payload
 
 
@@ -195,11 +196,7 @@ def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
 def _is_multi_intent(questions: list[str], combined: str) -> bool:
     if len(questions) > 1:
         return True
-    if combined.count("？") + combined.count("?") >= 2:
-        return True
-    if combined.count("；") + combined.count(";") >= 1:
-        return True
-    return _contains_any(combined, ("\u540c\u65f6", "\u4ee5\u53ca", "\u5e76\u4e14", "\u5206\u522b", "\u5e76\u8bf4\u660e", "\u5e76\u5206\u6790", "\u5e76\u89e3\u91ca"))
+    return plan_subtasks(combined).multi_intent
 
 
 def _is_ambiguous_question(
@@ -227,8 +224,10 @@ def _classify_question_labels(
     combined = normalize_text(" ".join(questions))
     lower_combined = combined.lower()
     labels = set(_allowed_labels(manual_labels))
+    plan = plan_subtasks(combined)
+    intent_set = set(plan.intents)
 
-    has_multi = _is_multi_intent(questions, combined)
+    has_multi = len(questions) > 1 or plan.multi_intent
     has_validation = _contains_any(combined, VALIDATION_KEYWORDS)
     has_cause = _contains_any(combined, CAUSE_KEYWORDS)
     has_open = _contains_any(combined, OPEN_KEYWORDS)
@@ -238,6 +237,7 @@ def _classify_question_labels(
         _contains_any(combined, ANALYSIS_KEYWORDS)
         or bool(re.search(r"top\s*\d+", lower_combined))
         or bool(re.search(r"近[一二三四五六七八九十\d]+年", combined))
+        or bool(intent_set.intersection({"ranking", "yoy", "maxmin", "trend", "attribution"}))
         or has_validation
         or has_cause
         or has_open

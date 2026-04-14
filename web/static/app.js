@@ -18,6 +18,14 @@
   editingQuestionId: "",
   evidenceEntries: [],
   historyExpanded: false,
+  busy: {
+    ask: false,
+    upload: false,
+    rebuild: false,
+    export: false,
+  },
+  databaseReady: false,
+  databaseRebuilding: false,
 };
 
 const refs = {
@@ -104,17 +112,64 @@ function isPdfReference(value) {
 }
 
 async function api(url, options = {}) {
-  const response = await fetch(url, options);
-  const data = await response.json().catch(() => ({ error: "服务返回了不可解析的响应" }));
-  if (!response.ok && !data.error) {
-    data.error = `请求失败：${response.status}`;
+  try {
+    const response = await fetch(url, options);
+    const data = await response.json().catch(() => ({ error: "服务返回了不可解析的响应" }));
+    if (!response.ok && !data.error) {
+      data.error = `请求失败：${response.status}`;
+    }
+    if (!data.message && data.error) {
+      data.message = data.error;
+    }
+    return data;
+  } catch (_error) {
+    return { error: "网络请求失败，请稍后重试。", message: "网络请求失败，请稍后重试。" };
   }
-  return data;
 }
 
 function setStatus(node, message, isError = false) {
   node.textContent = message || "";
   node.classList.toggle("error", Boolean(message) && isError);
+}
+
+function responseMessage(data, fallback = "请求失败，请稍后重试。") {
+  return data?.message || data?.error || fallback;
+}
+
+function setButtonGroupDisabled(buttons, disabled) {
+  (buttons || []).forEach((button) => {
+    if (button) {
+      button.disabled = disabled;
+    }
+  });
+}
+
+function syncActionAvailability() {
+  const rebuilding = Boolean(state.databaseRebuilding || state.busy.rebuild);
+  setButtonGroupDisabled([refs.askButton], !state.databaseReady || rebuilding || state.busy.ask);
+  setButtonGroupDisabled([refs.uploadButton], rebuilding || state.busy.upload);
+  setButtonGroupDisabled([refs.rebuildButton, refs.rebuildTopButton], rebuilding);
+  setButtonGroupDisabled([refs.exportLatestButton, refs.exportHistoryButton], state.busy.export);
+}
+
+async function withBusy(action, options, executor) {
+  if (state.busy[action]) {
+    return null;
+  }
+  const { buttons = [], statusNode = null, loadingText = "" } = options || {};
+  state.busy[action] = true;
+  setButtonGroupDisabled(buttons, true);
+  if (statusNode && loadingText) {
+    setStatus(statusNode, loadingText);
+  }
+  syncActionAvailability();
+  try {
+    return await executor();
+  } finally {
+    state.busy[action] = false;
+    setButtonGroupDisabled(buttons, false);
+    syncActionAvailability();
+  }
 }
 
 function setView(viewName) {
@@ -224,25 +279,41 @@ function renderHistoryCard(item) {
 }
 
 async function exportRecords(records, format = "xlsx") {
-  const data = await api("/api/export-results", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ format, records }),
-  });
-  if (data.error) {
-    setStatus(refs.exportNotice, data.error, true);
+  if (!records?.length) {
+    setStatus(refs.exportNotice, "当前没有可导出的结果", true);
     return;
   }
-  setStatus(refs.exportNotice, `已导出：${data.path}`);
-  if (data.download_url) {
-    window.open(data.download_url, "_blank", "noopener");
-  }
-  await Promise.all([loadOverview(), loadFiles()]);
+  await withBusy(
+    "export",
+    {
+      buttons: [refs.exportLatestButton, refs.exportHistoryButton],
+      statusNode: refs.exportNotice,
+      loadingText: "正在导出…",
+    },
+    async () => {
+      const data = await api("/api/export-results", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ format, records }),
+      });
+      if (data.error) {
+        setStatus(refs.exportNotice, responseMessage(data), true);
+        return;
+      }
+      setStatus(refs.exportNotice, data.message ? `${data.message} ${data.path}` : `已导出：${data.path}`);
+      if (data.download_url) {
+        window.open(data.download_url, "_blank", "noopener");
+      }
+      await Promise.all([loadOverview(), loadFiles()]);
+    },
+  );
 }
 
 function renderOverview(data) {
   const database = data.database || {};
   const databaseReady = Boolean(database.ready);
+  state.databaseReady = databaseReady;
+  state.databaseRebuilding = Boolean(database.rebuilding);
   const databaseStatus = database.status_text || (databaseReady ? "数据库已就绪" : "数据库未就绪");
   const databaseAction = database.action_text || "";
   refs.overviewStats.innerHTML = (data.stats || [])
@@ -278,10 +349,13 @@ function renderOverview(data) {
     `}
   `;
 
-  refs.askButton.disabled = !databaseReady;
-  if (!databaseReady) {
+  syncActionAvailability();
+  if (!databaseReady && !state.databaseRebuilding) {
     setStatus(refs.askStatus, "当前数据库未按正式数据构建，请先点击“重建数据库”", true);
-  } else if (refs.askStatus.textContent.includes("未按正式数据构建")) {
+  } else if (state.databaseRebuilding && !state.busy.rebuild) {
+    setStatus(refs.askStatus, "正在重建数据库，请稍候…", true);
+    setStatus(refs.uploadStatus, "正在重建数据库，请稍候…");
+  } else if (refs.askStatus.textContent.includes("未按正式数据构建") || refs.askStatus.textContent.includes("正在重建数据库")) {
     setStatus(refs.askStatus, "");
   }
 }
@@ -513,21 +587,30 @@ async function askQuestion() {
     return;
   }
   state.currentQuestion = question;
-  setStatus(refs.askStatus, "处理中...");
-  const data = await api("/api/ask", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question }),
-  });
-  if (data.error) {
-    setStatus(refs.askStatus, data.error, true);
-    return;
-  }
-  state.latestAnswers = data.answers || [];
-  renderResults();
-  setStatus(refs.askStatus, "已完成");
-  await loadHistory();
-  refreshEvidenceEntries();
+  await withBusy(
+    "ask",
+    {
+      buttons: [refs.askButton],
+      statusNode: refs.askStatus,
+      loadingText: "正在提问…",
+    },
+    async () => {
+      const data = await api("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+      if (data.error) {
+        setStatus(refs.askStatus, responseMessage(data), true);
+        return;
+      }
+      state.latestAnswers = data.answers || [];
+      renderResults();
+      setStatus(refs.askStatus, "已完成");
+      await loadHistory();
+      refreshEvidenceEntries();
+    },
+  );
 }
 
 async function loadHistory() {
@@ -941,28 +1024,52 @@ async function uploadFile() {
   const formData = new FormData();
   formData.append("category", refs.uploadCategory.value);
   formData.append("file", file);
-  setStatus(refs.uploadStatus, "上传中...");
-  const response = await fetch("/api/upload", { method: "POST", body: formData });
-  const data = await response.json().catch(() => ({ error: "上传失败" }));
-  if (!response.ok || data.error) {
-    setStatus(refs.uploadStatus, data.error || "上传失败", true);
-    return;
-  }
-  setStatus(refs.uploadStatus, `已上传：${data.file?.name || file.name}`);
-  refs.uploadFile.value = "";
-  await Promise.all([loadFiles(), loadOverview()]);
+  await withBusy(
+    "upload",
+    {
+      buttons: [refs.uploadButton],
+      statusNode: refs.uploadStatus,
+      loadingText: "正在上传…",
+    },
+    async () => {
+      const data = await api("/api/upload", { method: "POST", body: formData });
+      if (data.error) {
+        setStatus(refs.uploadStatus, responseMessage(data, "上传失败"), true);
+        return;
+      }
+      setStatus(refs.uploadStatus, `已上传：${data.file?.name || file.name}`);
+      refs.uploadFile.value = "";
+      await Promise.all([loadFiles(), loadOverview()]);
+    },
+  );
 }
 
 async function rebuildDatabase() {
-  setStatus(refs.uploadStatus, "重建中...");
-  const data = await api("/api/rebuild-database", { method: "POST" });
-  if (data.error) {
-    setStatus(refs.uploadStatus, data.error, true);
-    return;
-  }
-  setStatus(refs.uploadStatus, "数据库已重建");
-  await Promise.all([loadOverview(), loadFiles(), loadQuestions(), loadTables()]);
-  await ensureDefaultTablePreview();
+  await withBusy(
+    "rebuild",
+    {
+      buttons: [refs.rebuildButton, refs.rebuildTopButton, refs.askButton, refs.uploadButton],
+      statusNode: refs.uploadStatus,
+      loadingText: "正在重建数据库，请稍候…",
+    },
+    async () => {
+      state.databaseRebuilding = true;
+      syncActionAvailability();
+      setStatus(refs.askStatus, "正在重建数据库，请稍候…", true);
+      const data = await api("/api/rebuild-database", { method: "POST" });
+      if (data.error) {
+        setStatus(refs.uploadStatus, responseMessage(data), true);
+        await loadOverview();
+        return;
+      }
+      setStatus(refs.uploadStatus, responseMessage(data, "数据库已重建"));
+      setStatus(refs.askStatus, "");
+      await Promise.all([loadOverview(), loadFiles(), loadQuestions(), loadTables()]);
+      await ensureDefaultTablePreview();
+    },
+  );
+  state.databaseRebuilding = false;
+  syncActionAvailability();
 }
 
 function bindEvents() {

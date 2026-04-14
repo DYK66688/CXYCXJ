@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any
 
 
+PERIOD_PATTERN = re.compile(r"20\d{2}(?:FY|Q1|Q2|Q3|HY)$")
+
+
 COMPANY_FIELD_ALIASES: dict[str, tuple[str, str]] = {
     "\u5458\u5de5\u4eba\u6570": ("employee_count", "\u5458\u5de5\u4eba\u6570"),
     "\u96c7\u5458\u4eba\u6570": ("employee_count", "\u5458\u5de5\u4eba\u6570"),
@@ -19,21 +22,216 @@ COMPANY_FIELD_ALIASES: dict[str, tuple[str, str]] = {
     "\u516c\u53f8\u540d\u79f0": ("company_name", "\u516c\u53f8\u540d\u79f0"),
 }
 
+STANDARD_METRIC_CATALOG: list[dict[str, Any]] = [
+    {
+        "table": "income_sheet",
+        "column": "total_profit",
+        "label": "利润总额",
+        "yoy_column": "total_profit_yoy_growth",
+        "aliases": ["利润总额"],
+    },
+    {
+        "table": "income_sheet",
+        "column": "net_profit",
+        "label": "净利润",
+        "yoy_column": "net_profit_yoy_growth",
+        "aliases": ["净利润", "利润"],
+    },
+    {
+        "table": "income_sheet",
+        "column": "main_business_revenue",
+        "label": "主营业务收入",
+        "yoy_column": "main_business_revenue_yoy_growth",
+        "aliases": ["主营业务收入"],
+    },
+    {
+        "table": "income_sheet",
+        "column": "total_operating_revenue",
+        "label": "营业总收入",
+        "yoy_column": "operating_revenue_yoy_growth",
+        "aliases": ["营业总收入", "营业收入", "销售额"],
+    },
+    {
+        "table": "income_sheet",
+        "column": "operating_expense_rnd_expenses",
+        "label": "研发费用",
+        "aliases": ["研发费用"],
+    },
+    {
+        "table": "income_sheet",
+        "column": "operating_expense_selling_expenses",
+        "label": "销售费用",
+        "aliases": ["销售费用"],
+    },
+    {
+        "table": "income_sheet",
+        "column": "operating_expense_administrative_expenses",
+        "label": "管理费用",
+        "aliases": ["管理费用"],
+    },
+    {
+        "table": "income_sheet",
+        "column": "operating_expense_financial_expenses",
+        "label": "财务费用",
+        "aliases": ["财务费用"],
+    },
+    {
+        "table": "income_sheet",
+        "column": "operating_expense_taxes_and_surcharges",
+        "label": "税金及附加",
+        "aliases": ["税金及附加"],
+    },
+    {
+        "table": "income_sheet",
+        "column": "total_operating_expenses",
+        "label": "营业总支出",
+        "aliases": ["营业总支出"],
+    },
+    {
+        "table": "balance_sheet",
+        "column": "asset_cash_and_cash_equivalents",
+        "label": "货币资金",
+        "aliases": ["货币资金"],
+    },
+    {
+        "table": "balance_sheet",
+        "column": "asset_accounts_receivable",
+        "label": "应收账款",
+        "aliases": ["应收账款"],
+    },
+    {
+        "table": "balance_sheet",
+        "column": "asset_inventory",
+        "label": "存货",
+        "aliases": ["存货"],
+    },
+    {
+        "table": "balance_sheet",
+        "column": "asset_total_assets",
+        "label": "总资产",
+        "yoy_column": "asset_total_assets_yoy_growth",
+        "aliases": ["总资产", "资产总额"],
+    },
+    {
+        "table": "balance_sheet",
+        "column": "liability_total_liabilities",
+        "label": "负债总额",
+        "yoy_column": "liability_total_liabilities_yoy_growth",
+        "aliases": ["负债总额", "总负债"],
+    },
+    {
+        "table": "balance_sheet",
+        "column": "asset_liability_ratio",
+        "label": "资产负债率",
+        "aliases": ["资产负债率"],
+    },
+    {
+        "table": "balance_sheet",
+        "column": "equity_parent_net_assets",
+        "label": "归母净资产",
+        "aliases": ["归母净资产", "归属于上市公司股东的净资产", "归属于母公司股东的净资产"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "eps",
+        "label": "基本每股收益",
+        "aliases": ["基本每股收益", "每股收益"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "diluted_eps",
+        "label": "稀释每股收益",
+        "aliases": ["稀释每股收益"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "operating_revenue_yoy_growth",
+        "label": "营业总收入同比增长率",
+        "aliases": ["营业总收入同比增长率", "营业总收入同比增长"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "operating_revenue_qoq_growth",
+        "label": "营业总收入环比增长率",
+        "aliases": ["营业总收入环比增长率", "营业总收入季度环比增长"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "net_profit_yoy_growth",
+        "label": "净利润同比增长率",
+        "aliases": ["净利润同比增长率", "净利润同比增长"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "net_profit_qoq_growth",
+        "label": "净利润环比增长率",
+        "aliases": ["净利润环比增长率", "净利润季度环比增长"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "gross_profit_margin",
+        "label": "销售毛利率",
+        "aliases": ["销售毛利率"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "net_profit_margin",
+        "label": "销售净利率",
+        "aliases": ["销售净利率"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "roe",
+        "label": "加权平均净资产收益率",
+        "aliases": ["净资产收益率", "加权平均净资产收益率"],
+    },
+    {
+        "table": "core_performance_indicators_sheet",
+        "column": "roe_weighted_excl_non_recurring",
+        "label": "加权平均净资产收益率（扣非）",
+        "aliases": ["加权平均净资产收益率（扣非）", "加权平均净资产收益率(扣非)"],
+    },
+    {
+        "table": "cash_flow_sheet",
+        "column": "operating_cf_net_amount",
+        "label": "经营活动现金流量净额",
+        "aliases": ["经营活动现金流量净额", "经营性现金流", "经营性现金流量净额"],
+    },
+    {
+        "table": "cash_flow_sheet",
+        "column": "investing_cf_net_amount",
+        "label": "投资活动现金流量净额",
+        "aliases": ["投资活动现金流量净额", "投资性现金流量净额"],
+    },
+    {
+        "table": "cash_flow_sheet",
+        "column": "financing_cf_net_amount",
+        "label": "筹资活动现金流量净额",
+        "aliases": ["筹资活动现金流量净额", "融资活动现金流量净额", "融资性现金流量净额"],
+    },
+    {
+        "table": "cash_flow_sheet",
+        "column": "net_cash_flow",
+        "label": "净现金流",
+        "yoy_column": "net_cash_flow_yoy_growth",
+        "aliases": ["净现金流"],
+    },
+]
+
+STANDARD_METRIC_LABELS: dict[tuple[str, str], str] = {
+    (item["table"], item["column"]): item["label"] for item in STANDARD_METRIC_CATALOG
+}
+
+FACT_METRIC_SPECS: dict[str, list[tuple[str, str, str | None]]] = {}
+for _metric in STANDARD_METRIC_CATALOG:
+    FACT_METRIC_SPECS.setdefault(_metric["table"], []).append(
+        (_metric["column"], _metric["label"], _metric.get("yoy_column"))
+    )
+
 METRIC_ALIASES: list[tuple[str, tuple[str, str, str]]] = [
-    ("\u5229\u6da6\u603b\u989d", ("income_sheet", "total_profit", "\u5229\u6da6\u603b\u989d")),
-    ("\u51c0\u5229\u6da6", ("income_sheet", "net_profit", "\u51c0\u5229\u6da6")),
-    ("\u4e3b\u8425\u4e1a\u52a1\u6536\u5165", ("income_sheet", "main_business_revenue", "\u4e3b\u8425\u4e1a\u52a1\u6536\u5165")),
-    ("\u8425\u4e1a\u603b\u6536\u5165", ("income_sheet", "total_operating_revenue", "\u8425\u4e1a\u603b\u6536\u5165")),
-    ("\u8425\u4e1a\u6536\u5165", ("income_sheet", "total_operating_revenue", "\u8425\u4e1a\u6536\u5165")),
-    ("\u9500\u552e\u989d", ("income_sheet", "total_operating_revenue", "\u9500\u552e\u989d")),
-    ("\u6bcf\u80a1\u6536\u76ca", ("core_performance_indicators_sheet", "eps", "\u6bcf\u80a1\u6536\u76ca")),
-    ("\u8d27\u5e01\u8d44\u91d1", ("balance_sheet", "asset_cash_and_cash_equivalents", "\u8d27\u5e01\u8d44\u91d1")),
-    ("\u5e94\u6536\u8d26\u6b3e", ("balance_sheet", "asset_accounts_receivable", "\u5e94\u6536\u8d26\u6b3e")),
-    ("\u5b58\u8d27", ("balance_sheet", "asset_inventory", "\u5b58\u8d27")),
-    ("\u7ecf\u8425\u6027\u73b0\u91d1\u6d41", ("cash_flow_sheet", "operating_cf_net_amount", "\u7ecf\u8425\u6027\u73b0\u91d1\u6d41")),
-    ("\u7ecf\u8425\u6d3b\u52a8\u4ea7\u751f\u7684\u73b0\u91d1\u6d41\u91cf\u51c0\u989d", ("cash_flow_sheet", "operating_cf_net_amount", "\u7ecf\u8425\u6d3b\u52a8\u4ea7\u751f\u7684\u73b0\u91d1\u6d41\u91cf\u51c0\u989d")),
-    ("\u51c0\u73b0\u91d1\u6d41", ("cash_flow_sheet", "net_cash_flow", "\u51c0\u73b0\u91d1\u6d41")),
-    ("\u5229\u6da6", ("income_sheet", "net_profit", "\u5229\u6da6")),
+    (alias, (item["table"], item["column"], item["label"]))
+    for item in STANDARD_METRIC_CATALOG
+    for alias in item.get("aliases", [])
 ]
 
 CAUSE_KEYWORDS = (
@@ -50,6 +248,20 @@ CAUSE_KEYWORDS = (
     "\u6062\u590d",
     "\u6539\u5584",
 )
+
+CHART_KEYWORDS = ("\u53ef\u89c6\u5316", "\u7ed8\u56fe", "\u56fe\u8868", "\u6298\u7ebf\u56fe", "\u67f1\u72b6\u56fe")
+TREND_KEYWORDS = ("\u8d8b\u52bf", "\u53d8\u5316", "\u60c5\u51b5")
+ATTRIBUTION_KEYWORDS = ("\u539f\u56e0", "\u5f52\u56e0", "\u4e3a\u4ec0\u4e48", "\u4e3a\u4f55")
+LATEST_KEYWORDS = ("\u6700\u65b0", "\u6700\u8fd1\u4e00\u671f", "\u6700\u8fd1\u4e00\u5b63", "\u5f53\u524d")
+RESEARCH_KEYWORDS = ("\u7814\u62a5", "\u8bc4\u7ea7", "\u5238\u5546")
+INDUSTRY_QUERY_KEYWORDS = ("\u533b\u4fdd", "\u76ee\u5f55", "\u8c08\u5224", "\u4e2d\u836f", "\u884c\u4e1a")
+PRODUCT_QUERY_KEYWORDS = ("\u65b0\u589e", "\u4ea7\u54c1", "\u54ea\u4e9b")
+FOLLOW_UP_HINTS = ("\u90a3", "\u90a3\u4e48", "\u8fd9\u4e2a", "\u8fd9\u4e9b", "\u5176\u4e2d", "\u8fd9\u5bb6", "\u8be5\u516c\u53f8", "\u5b83", "\u5176", "\u7ee7\u7eed", "\u5462")
+RANKING_KEYWORDS = ("\u6392\u540d", "\u524d", "top", "topk")
+YOY_KEYWORDS = ("\u540c\u6bd4", "\u589e\u901f", "\u589e\u5e45", "\u589e\u957f\u7387", "\u8f83\u4e0a\u5e74", "\u6bd4\u4e0a\u5e74")
+MAX_KEYWORDS = ("\u6700\u5927", "\u6700\u9ad8", "\u6700\u591a")
+MIN_KEYWORDS = ("\u6700\u5c0f", "\u6700\u4f4e", "\u6700\u5c11")
+MULTI_INTENT_CONNECTORS = ("\u540c\u65f6", "\u4ee5\u53ca", "\u5e76\u4e14", "\u5e76\u8bf4\u660e", "\u5e76\u5206\u6790", "\u5e76\u89e3\u91ca", "\u5e76\u7ed9\u51fa", "\u5e76\u6307\u51fa", "\u5206\u522b")
 
 
 QUARTER_1_FLAGS = ("\u7b2c\u4e00\u5b63\u5ea6", "\u4e00\u5b63\u5ea6", "Q1", "q1")
@@ -75,6 +287,55 @@ def normalize_text(text: str) -> str:
 
 def compact_text(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
+
+
+def normalize_report_period(value: Any) -> str:
+    text = compact_text(str(value or "")).upper()
+    if not text:
+        return ""
+    normalized = (
+        text.replace("年年度", "FY")
+        .replace("半年报", "HY")
+        .replace("半年度", "HY")
+        .replace("年度", "FY")
+        .replace("年报", "FY")
+        .replace("第一季度", "Q1")
+        .replace("一季度", "Q1")
+        .replace("第二季度", "Q2")
+        .replace("二季度", "Q2")
+        .replace("第三季度", "Q3")
+        .replace("三季度", "Q3")
+        .replace("第四季度", "Q4")
+        .replace("四季度", "Q4")
+        .replace("年", "")
+    )
+    match = re.search(r"(20\d{2})(FY|HY|Q1|Q2|Q3|Q4)", normalized)
+    return f"{match.group(1)}{match.group(2)}" if match else text
+
+
+def is_valid_report_period(value: Any) -> bool:
+    return bool(PERIOD_PATTERN.fullmatch(normalize_report_period(value)))
+
+
+def has_encoding_issue(text: Any) -> bool:
+    probe = normalize_text(str(text or ""))
+    if not probe:
+        return False
+    meaningful = [char for char in probe if not char.isspace()]
+    if not meaningful:
+        return False
+    bad_count = 0
+    for char in meaningful:
+        code = ord(char)
+        allowed = (char.isascii() and char.isprintable()) or ("\u4e00" <= char <= "\u9fff")
+        allowed = allowed or (0x3000 <= code <= 0x303F) or (0xFF00 <= code <= 0xFFEF)
+        if not allowed:
+            bad_count += 1
+    return bad_count / len(meaningful) > 0.12
+
+
+def get_standard_metric_label(table: str, column: str) -> str:
+    return STANDARD_METRIC_LABELS[(table, column)]
 
 
 def parse_question_payload(raw: str) -> list[dict[str, str]]:

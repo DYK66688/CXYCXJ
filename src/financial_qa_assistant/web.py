@@ -5,6 +5,7 @@ import csv
 import json
 import mimetypes
 import re
+import threading
 import uuid
 from datetime import datetime
 from http import HTTPStatus
@@ -32,10 +33,61 @@ DOWNLOADABLE_SUFFIXES = INLINE_FILE_SUFFIXES | {".xlsx", ".json", ".csv", ".zip"
 UPLOAD_SOURCE_SUFFIXES = {".xlsx", ".xlsm", ".pdf", ".csv", ".json", ".txt"}
 MAX_HISTORY = 60
 MAX_CUSTOM_QUESTIONS = 200
+REBUILD_BLOCKED_ROUTES = {
+    "/api/ask": "数据库正在重建，请稍候后再提问。",
+    "/api/upload": "数据库正在重建，请稍候后再上传。",
+    "/api/rebuild-database": "数据库正在重建，请勿重复触发。",
+}
 
 
 def _iso_now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+class RebuildMutex:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._in_progress = False
+        self._started_at = ""
+
+    def begin(self) -> bool:
+        if not self._lock.acquire(blocking=False):
+            return False
+        with self._state_lock:
+            self._in_progress = True
+            self._started_at = _iso_now()
+        return True
+
+    def finish(self) -> None:
+        with self._state_lock:
+            self._in_progress = False
+            self._started_at = ""
+        if self._lock.locked():
+            self._lock.release()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._state_lock:
+            return {
+                "in_progress": self._in_progress,
+                "started_at": self._started_at,
+            }
+
+    def is_busy(self) -> bool:
+        return bool(self.snapshot()["in_progress"])
+
+
+def _rebuild_busy_payload(route: str) -> dict[str, Any]:
+    message = REBUILD_BLOCKED_ROUTES.get(route, "数据库正在重建，请稍候后再试。")
+    return {"ok": False, "error": message, "message": message, "code": "rebuild_in_progress"}
+
+
+def _guard_rebuild_request(route: str, mutex: RebuildMutex) -> tuple[dict[str, Any], HTTPStatus] | None:
+    if route not in REBUILD_BLOCKED_ROUTES:
+        return None
+    if not mutex.is_busy():
+        return None
+    return _rebuild_busy_payload(route), HTTPStatus.CONFLICT
 
 
 
@@ -567,6 +619,7 @@ def serve(engine: FinancialQAEngine, config: AppConfig, host: str = "127.0.0.1",
     static_root = config.static_dir
     workspace_root = config.workspace_root
     session_contexts: dict[str, dict[str, Any]] = {}
+    rebuild_mutex = RebuildMutex()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
@@ -663,7 +716,13 @@ def serve(engine: FinancialQAEngine, config: AppConfig, host: str = "127.0.0.1",
             if route == "/api/sample-questions":
                 return self._send_json({"samples": _sample_questions(engine, config)})
             if route == "/api/overview":
-                return self._send_json(_overview_payload(engine, config))
+                overview = _overview_payload(engine, config)
+                rebuild_state = rebuild_mutex.snapshot()
+                overview["database"]["rebuilding"] = bool(rebuild_state["in_progress"])
+                if rebuild_state["in_progress"]:
+                    overview["database"]["status_text"] = "正在重建数据库，请稍候…"
+                    overview["database"]["action_text"] = "重建完成后可继续提问、上传和导出。"
+                return self._send_json(overview)
             if route == "/api/reset-context":
                 session_contexts.pop(self._get_session_id(), None)
                 return self._send_json({"ok": True})
@@ -701,6 +760,10 @@ def serve(engine: FinancialQAEngine, config: AppConfig, host: str = "127.0.0.1",
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             route = parsed.path
+            blocked = _guard_rebuild_request(route, rebuild_mutex)
+            if blocked is not None:
+                payload, status = blocked
+                return self._send_json(payload, status=status)
 
             if route == "/api/ask":
                 status = database_status(config)
@@ -711,21 +774,41 @@ def serve(engine: FinancialQAEngine, config: AppConfig, host: str = "127.0.0.1",
                         },
                         status=HTTPStatus.CONFLICT,
                     )
-                payload = self._read_json_body()
-                question = str(payload.get("question", "")).strip()
-                if not question:
-                    return self._send_json({"error": "question 不能为空"}, status=HTTPStatus.BAD_REQUEST)
-                answers = _answer_public(engine, question, self._session_context())
-                _append_answer_history(config, question, answers)
-                return self._send_json({"answers": answers})
+                try:
+                    payload = self._read_json_body()
+                    question = str(payload.get("question", "")).strip()
+                    if not question:
+                        return self._send_json({"error": "question 不能为空"}, status=HTTPStatus.BAD_REQUEST)
+                    answers = _answer_public(engine, question, self._session_context())
+                    _append_answer_history(config, question, answers)
+                    return self._send_json({"answers": answers})
+                except Exception:
+                    return self._send_json(
+                        {"error": "提问失败，请稍后重试。", "message": "提问失败，请稍后重试。"},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
             if route == "/api/upload":
                 try:
                     return self._handle_upload()
                 except ValueError as exc:
                     return self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                except Exception:
+                    return self._send_json({"error": "上传失败，请稍后重试。", "message": "上传失败，请稍后重试。"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             if route == "/api/rebuild-database":
-                self._refresh_engine()
-                return self._send_json({"ok": True, "overview": _overview_payload(engine, config)})
+                if not rebuild_mutex.begin():
+                    return self._send_json(_rebuild_busy_payload(route), status=HTTPStatus.CONFLICT)
+                try:
+                    self._refresh_engine()
+                    overview = _overview_payload(engine, config)
+                    overview["database"]["rebuilding"] = False
+                    return self._send_json({"ok": True, "message": "数据库已重建。", "overview": overview})
+                except Exception:
+                    return self._send_json(
+                        {"ok": False, "error": "数据库重建失败，请查看终端日志后重试。", "message": "数据库重建失败，请查看终端日志后重试。"},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                finally:
+                    rebuild_mutex.finish()
             if route == "/api/custom-questions/save":
                 try:
                     payload = self._read_json_body()
@@ -750,7 +833,7 @@ def serve(engine: FinancialQAEngine, config: AppConfig, host: str = "127.0.0.1",
                 records = payload.get("records") or []
                 try:
                     exported = _export_records(config, records, "json" if file_format == "json" else "xlsx")
-                    return self._send_json({"ok": True, **exported})
+                    return self._send_json({"ok": True, "message": "导出完成。", **exported})
                 except ValueError as exc:
                     return self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             self.send_error(HTTPStatus.NOT_FOUND)

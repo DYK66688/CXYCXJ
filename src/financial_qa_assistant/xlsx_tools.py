@@ -102,8 +102,20 @@ def _cell_xml(reference: str, value: object) -> str:
     return f'<c r="{reference}" t="inlineStr"><is><t xml:space="preserve">{escaped}</t></is></c>'
 
 
-def write_simple_xlsx(path: Path, sheet_name: str, rows: list[list[object]]) -> None:
+def _normalize_row_width(rows: list[list[object]], column_count: int | None = None) -> list[list[object]]:
+    width = column_count if column_count is not None else max((len(row) for row in rows), default=1)
+    normalized: list[list[object]] = []
+    for row in rows:
+        trimmed = list(row[:width])
+        if len(trimmed) < width:
+            trimmed.extend("" for _ in range(width - len(trimmed)))
+        normalized.append(trimmed)
+    return normalized
+
+
+def write_simple_xlsx(path: Path, sheet_name: str, rows: list[list[object]], column_count: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    rows = _normalize_row_width(rows, column_count=column_count)
     max_col = max((len(row) for row in rows), default=1)
     max_row = max(len(rows), 1)
     dimension = f"A1:{_number_to_col(max_col)}{max_row}"

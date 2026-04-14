@@ -12,6 +12,29 @@ from .utils import dump_json
 from .web import serve
 
 
+def _resolve_export_output(config: AppConfig, question_file: Path, explicit_output: str = "") -> Path:
+    if explicit_output:
+        return Path(explicit_output)
+    name = question_file.name
+    if "附件4" in name:
+        return config.submission_dir / "result_2.xlsx"
+    if "附件6" in name:
+        return config.submission_dir / "result_3.xlsx"
+    try:
+        from .xlsx_tools import read_workbook, rows_to_dicts
+
+        workbook = read_workbook(question_file)
+        rows = rows_to_dicts(next(iter(workbook.values()), []))
+        question_ids = [str(row.get("编号", "")).strip() for row in rows if str(row.get("编号", "")).strip()]
+        if question_ids and all(question_id.startswith("B1") for question_id in question_ids):
+            return config.submission_dir / "result_2.xlsx"
+        if question_ids and all(question_id.startswith("B2") for question_id in question_ids):
+            return config.submission_dir / "result_3.xlsx"
+    except Exception:
+        pass
+    return config.submission_dir / f"{question_file.stem}_答案结果.xlsx"
+
+
 def _ensure_database(config: AppConfig, log=None) -> Database:
     status = database_status(config)
     if not status["ready"]:
@@ -90,16 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "export":
         question_files = [Path(args.question_file)] if args.question_file else config.question_files()
         for question_file in question_files:
-            if args.output:
-                output = Path(args.output)
-            else:
-                name = question_file.name
-                if "附件4" in name:
-                    output = config.submission_dir / "result_2.xlsx"
-                elif "附件6" in name:
-                    output = config.submission_dir / "result_3.xlsx"
-                else:
-                    output = config.submission_dir / f"{question_file.stem}_答案结果.xlsx"
+            output = _resolve_export_output(config, question_file, args.output)
             engine.batch_export(question_file, output)
             _emit(f"已导出: {output}")
         return 0

@@ -5,7 +5,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter, sleep
-from typing import Callable
+from typing import Any, Callable
 
 from .database_base import (
     Database,
@@ -21,6 +21,7 @@ from .database_base import (
     refresh_metric_facts,
 )
 from .database_extract import load_financial_reports, load_research_pdf_chunks
+from .validation import run_validation
 
 
 LogFn = Callable[[str], None]
@@ -31,7 +32,7 @@ def _emit(log: LogFn | None, message: str) -> None:
         log(message)
 
 
-def _run_step(log: LogFn | None, label: str, action) -> None:
+def _run_step(log: LogFn | None, label: str, action) -> float:
     started = perf_counter()
     _emit(log, f"[开始] {label}")
     action()
@@ -48,6 +49,7 @@ def _swap_database(temp_path: Path, target_path: Path, log: LogFn | None = None)
         _emit(log, f"[开始] 备份旧数据库：{backup_path.name}")
         target_path.replace(backup_path)
         _emit(log, f"[完成] 备份旧数据库：{backup_path.name}")
+
     gc.collect()
     last_error: Exception | None = None
     for attempt in range(1, 6):
@@ -61,11 +63,13 @@ def _swap_database(temp_path: Path, target_path: Path, log: LogFn | None = None)
             _emit(log, f"[等待] 替换正式数据库失败，{attempt}/5 次重试：{exc}")
             sleep(1.0)
             gc.collect()
+
     if last_error is not None:
         if backup_path.exists() and not target_path.exists():
             backup_path.replace(target_path)
             _emit(log, "[回滚] 新数据库替换失败，已恢复旧数据库")
         raise last_error
+
     if backup_path.exists():
         backup_path.unlink()
 
@@ -157,10 +161,13 @@ def ingest_all(config, log: LogFn | None = None):
     financial_pdf_count = len(config.financial_report_pdfs())
     research_pdf_count = len(config.research_report_pdfs())
     stage_durations: dict[str, float] = {}
+    extraction_report: dict[str, Any] = {}
+    validation_report: dict[str, Any] = {}
 
     _emit(log, f"建库目标：{config.db_path}")
     _emit(log, f"正式数据目录：{config.contest_data_dir}")
     _emit(log, f"临时数据库：{temp_db_path}")
+
     try:
         stage_durations["创建基础表"] = _run_step(log, "创建基础表", lambda: create_base_tables(database))
         stage_durations["创建财务表结构"] = _run_step(log, "创建财务表结构", lambda: create_financial_tables(database, config.schema_file()))
@@ -181,16 +188,34 @@ def ingest_all(config, log: LogFn | None = None):
         stage_durations["清空历史文档分片"] = _run_step(log, "清空历史文档分片", lambda: database.execute("DELETE FROM document_chunks"))
         stage_durations["写入公司简介分片"] = _run_step(log, "写入公司简介分片", lambda: load_company_profile_chunks(database))
         stage_durations["写入研报元数据分片"] = _run_step(log, "写入研报元数据分片", lambda: load_research_metadata_chunks(database))
-        stage_durations["解析财报 PDF"] = _run_step(log, "解析财报 PDF", lambda: load_financial_reports(database, config, log=log))
+
+        def _load_financial_reports() -> None:
+            nonlocal extraction_report
+            extraction_report = load_financial_reports(database, config, log=log) or {}
+
+        stage_durations["解析财报 PDF"] = _run_step(log, "解析财报 PDF", _load_financial_reports)
         stage_durations["解析研报 PDF"] = _run_step(log, "解析研报 PDF", lambda: load_research_pdf_chunks(database, config, log=log))
         stage_durations["导入种子 CSV"] = _run_step(log, "导入种子 CSV", lambda: load_seed_csvs(database, config))
         stage_durations["导入手工补录 CSV"] = _run_step(log, "导入手工补录 CSV", lambda: load_manual_csvs(database, config))
         stage_durations["刷新指标事实表"] = _run_step(log, "刷新指标事实表", lambda: refresh_metric_facts(database))
 
-        document_chunk_count = database.table_row_count("document_chunks")
-        metric_fact_count = database.table_row_count("financial_metric_facts")
-        _emit(log, f"文档分片：{document_chunk_count} 条")
-        _emit(log, f"指标事实：{metric_fact_count} 条")
+        def _run_validation_stage() -> None:
+            nonlocal validation_report
+            validation_report = run_validation(database, config, extraction_report=extraction_report, log=log)
+
+        stage_durations["运行建库校验"] = _run_step(log, "运行建库校验", _run_validation_stage)
+
+        row_counts = {
+            "company_info": database.table_row_count("company_info"),
+            "question_bank": database.table_row_count("question_bank"),
+            "stock_research": database.table_row_count("stock_research"),
+            "industry_research": database.table_row_count("industry_research"),
+            "document_chunks": database.table_row_count("document_chunks"),
+            "financial_metric_facts": database.table_row_count("financial_metric_facts"),
+        }
+        _emit(log, f"文档分片：{row_counts['document_chunks']} 条")
+        _emit(log, f"指标事实：{row_counts['financial_metric_facts']} 条")
+        _emit(log, f"校验报告：{config.runtime_dir / 'validation_report.json'}")
 
         stage_durations["替换正式数据库"] = _run_step(log, "替换正式数据库", lambda: _swap_database(temp_db_path, config.db_path, log))
         _write_ingest_manifest(config)
@@ -209,15 +234,10 @@ def ingest_all(config, log: LogFn | None = None):
                 "research_reports": research_pdf_count,
                 "total": financial_pdf_count + research_pdf_count,
             },
-            "row_counts": {
-                "company_info": database.table_row_count("company_info"),
-                "question_bank": database.table_row_count("question_bank"),
-                "stock_research": database.table_row_count("stock_research"),
-                "industry_research": database.table_row_count("industry_research"),
-                "document_chunks": document_chunk_count,
-                "financial_metric_facts": metric_fact_count,
-            },
+            "row_counts": row_counts,
             "stage_durations_seconds": {key: round(value, 3) for key, value in stage_durations.items()},
+            "validation_report": str((config.runtime_dir / "validation_report.json").resolve()),
+            "validation_summary": validation_report.get("summary", {}),
         }
         _write_ingest_report(config, report_payload)
         _emit(log, f"建库报告：{config.ingest_report_path}")
@@ -247,6 +267,8 @@ def ingest_all(config, log: LogFn | None = None):
                 "financial_metric_facts": database.table_row_count("financial_metric_facts") if database.table_exists("financial_metric_facts") else 0,
             },
             "stage_durations_seconds": {key: round(value, 3) for key, value in stage_durations.items()},
+            "validation_report": str((config.runtime_dir / "validation_report.json").resolve()),
+            "validation_summary": validation_report.get("summary", {}),
             "error": {
                 "type": type(exc).__name__,
                 "message": str(exc),
@@ -257,4 +279,4 @@ def ingest_all(config, log: LogFn | None = None):
         raise
 
 
-__all__ = ["Database", "database_status", "ensure_web_bootstrap_database", "ingest_all", "ingest_manifest_matches"]
+__all__ = ["Database", "database_status", "ensure_web_bootstrap_database", "ingest_all", "ingest_manifest_matches", "_write_ingest_report"]

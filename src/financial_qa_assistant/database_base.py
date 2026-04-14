@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 from .config import AppConfig
 from .pdf_tools import chunk_text
-from .utils import normalize_stock_code, sortable_period
+from .utils import FACT_METRIC_SPECS, get_standard_metric_label, normalize_stock_code, sortable_period
 from .xlsx_tools import read_workbook, rows_to_dicts
 
 
@@ -35,10 +35,12 @@ EXTRA_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("source_excerpt", "TEXT"),
     ],
     "core_performance_indicators_sheet": [
+        ("diluted_eps", "REAL"),
         ("source_file", "TEXT"),
         ("source_excerpt", "TEXT"),
     ],
     "balance_sheet": [
+        ("equity_parent_net_assets", "REAL"),
         ("source_file", "TEXT"),
         ("source_excerpt", "TEXT"),
     ],
@@ -48,25 +50,9 @@ EXTRA_COLUMNS: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
-FACT_COLUMN_MAP: dict[str, list[tuple[str, str, str | None]]] = {
-    "income_sheet": [
-        ("total_profit", "鍒╂鼎鎬婚", "total_profit_yoy_growth"),
-        ("net_profit", "鍑€鍒╂鼎", "net_profit_yoy_growth"),
-        ("total_operating_revenue", "营业总收入", "operating_revenue_yoy_growth"),
-        ("main_business_revenue", "涓昏惀涓氬姟鏀跺叆", "main_business_revenue_yoy_growth"),
-    ],
-    "core_performance_indicators_sheet": [
-        ("eps", "姣忚偂鏀剁泭", None),
-    ],
-    "balance_sheet": [
-        ("asset_total_assets", "总资产", "asset_total_assets_yoy_growth"),
-    ],
-    "cash_flow_sheet": [
-        ("operating_cf_net_amount", "经营活动现金流量净额", None),
-    ],
-}
+FACT_COLUMN_MAP: dict[str, list[tuple[str, str, str | None]]] = FACT_METRIC_SPECS
 
-NUMBER_TOKEN_PATTERN = re.compile(r"涓嶉€傜敤|-?[\d,]+(?:\.\d+)?%?")
+NUMBER_TOKEN_PATTERN = re.compile(r"不适用|-?[\d,]+(?:\.\d+)?%?")
 
 
 class Database:
@@ -528,12 +514,13 @@ def refresh_metric_facts(database: Database) -> None:
                 query_columns.append(yoy_column)
         table_rows = database.query(f"SELECT {', '.join(query_columns)} FROM {table}")
         for row in table_rows:
-            for column, label, yoy_column in mappings:
+            for column, _label, yoy_column in mappings:
                 if column not in row.keys():
                     continue
                 value = row[column]
                 if value in (None, ""):
                     continue
+                label = get_standard_metric_label(table, column)
                 rows.append(
                     (
                         row["stock_code"],

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -9,8 +10,17 @@ from typing import Any
 from .charting import bar_chart_svg, line_chart_svg, write_bar_chart_jpg, write_line_chart_jpg
 from .config import AppConfig
 from .database import Database
+from .planner import QueryPlan, plan_subtasks
 from .utils import (
+    ATTRIBUTION_KEYWORDS,
     CAUSE_KEYWORDS,
+    CHART_KEYWORDS,
+    FOLLOW_UP_HINTS,
+    INDUSTRY_QUERY_KEYWORDS,
+    LATEST_KEYWORDS,
+    PRODUCT_QUERY_KEYWORDS,
+    RESEARCH_KEYWORDS,
+    TREND_KEYWORDS,
     artifact_name,
     compact_text,
     detect_company_field,
@@ -26,18 +36,54 @@ from .utils import (
     score_text,
     sortable_period,
     split_sentences,
+    tokenize,
     to_float,
 )
-
-
-CHART_KEYWORDS = ("\u53ef\u89c6\u5316", "\u7ed8\u56fe", "\u56fe\u8868", "\u6298\u7ebf\u56fe", "\u67f1\u72b6\u56fe")
-TREND_KEYWORDS = ("\u8d8b\u52bf", "\u53d8\u5316", "\u60c5\u51b5")
-ATTRIBUTION_KEYWORDS = ("\u539f\u56e0", "\u5f52\u56e0", "\u4e3a\u4ec0\u4e48", "\u4e3a\u4f55")
-LATEST_KEYWORDS = ("\u6700\u65b0", "\u6700\u8fd1\u4e00\u671f", "\u6700\u8fd1\u4e00\u5b63", "\u5f53\u524d")
-RESEARCH_KEYWORDS = ("\u7814\u62a5", "\u8bc4\u7ea7", "\u5238\u5546")
-INDUSTRY_QUERY_KEYWORDS = ("\u533b\u4fdd", "\u76ee\u5f55", "\u8c08\u5224", "\u4e2d\u836f", "\u884c\u4e1a")
-PRODUCT_QUERY_KEYWORDS = ("\u65b0\u589e", "\u4ea7\u54c1", "\u54ea\u4e9b")
-FOLLOW_UP_HINTS = ("\u90a3", "\u90a3\u4e48", "\u8fd9\u4e2a", "\u8fd9\u4e9b", "\u5176\u4e2d", "\u8fd9\u5bb6", "\u8be5\u516c\u53f8", "\u5b83", "\u5176", "\u7ee7\u7eed", "\u5462")
+CROSS_COMPANY_KEYWORDS = (
+    "\u54ea\u4e9b\u4f01\u4e1a",
+    "\u54ea\u4e9b\u516c\u53f8",
+    "\u516c\u53f8\u6709\u54ea\u4e9b",
+    "\u4f01\u4e1a\u6709\u54ea\u4e9b",
+    "\u6392\u540d",
+    "\u524d\u4e94",
+    "\u524d\u5341",
+    "top",
+    "\u8d85\u8fc7",
+    "\u9ad8\u4e8e",
+    "\u4f4e\u4e8e",
+    "\u5c11\u4e8e",
+    "\u4e0d\u4f4e\u4e8e",
+    "\u4e0d\u5c11\u4e8e",
+    "\u4e0d\u8d85\u8fc7",
+)
+RETRIEVAL_STOPWORDS = {
+    "\u516c\u53f8",
+    "\u4f01\u4e1a",
+    "\u54ea\u4e9b",
+    "\u4ec0\u4e48",
+    "\u4e3a\u4ec0\u4e48",
+    "\u5982\u4f55",
+    "\u60c5\u51b5",
+    "\u53d8\u5316",
+    "\u8d8b\u52bf",
+    "\u5206\u6790",
+    "\u539f\u56e0",
+    "\u4e0a\u5347",
+    "\u4e0b\u964d",
+    "\u589e\u957f",
+    "\u7814\u62a5",
+}
+GENERIC_COMPANY_FRAGMENTS = {
+    "\u516c\u53f8",
+    "\u80a1\u4efd",
+    "\u6709\u9650",
+    "\u96c6\u56e2",
+    "\u836f\u4e1a",
+    "\u533b\u836f",
+    "\u5236\u836f",
+    "\u751f\u7269",
+    "\u79d1\u6280",
+}
 
 
 @dataclass(slots=True)
@@ -57,12 +103,30 @@ class AnswerPayload:
         }
 
 
+@dataclass(slots=True)
+class PlannedQuestionState:
+    question: str
+    compact_question: str
+    plan: QueryPlan
+    follow_up: bool
+    company: dict[str, Any] | None
+    metric: tuple[str, str, str] | None
+    period_info: dict[str, str] | None
+    company_field: tuple[str, str] | None
+    context_before: dict[str, Any]
+    debug_trace: dict[str, Any] = field(default_factory=dict)
+
+
 class FinancialQAEngine:
     def __init__(self, config: AppConfig, database: Database | None = None) -> None:
         self.config = config
         self.database = database or Database(config.db_path)
+        self.last_debug_trace: dict[str, Any] = {}
         self.company_rows = self.database.query("SELECT * FROM company_info ORDER BY stock_code")
         self.company_aliases = self._build_company_aliases()
+        self.company_code_map = self._build_company_code_map()
+        self.company_fragment_aliases = self._build_company_fragment_aliases()
+        self._ensure_runtime_indexes()
         self.question_bank_rows = self._load_question_bank_rows()
 
     def _build_company_aliases(self) -> dict[str, dict[str, Any]]:
@@ -80,9 +144,65 @@ class FinancialQAEngine:
                     aliases[name] = payload
         return aliases
 
+    def _build_company_code_map(self) -> dict[str, dict[str, Any]]:
+        return {
+            normalize_stock_code(row["stock_code"]): dict(row)
+            for row in self.company_rows
+            if normalize_stock_code(row["stock_code"])
+        }
+
+    def _build_company_fragment_aliases(self) -> dict[str, dict[str, Any]]:
+        fragment_candidates: dict[str, list[dict[str, Any]]] = {}
+        for row in self.company_rows:
+            payload = dict(row)
+            fragments: set[str] = set()
+            for source in (str(row["stock_abbr"] or "").strip(), str(row["company_name"] or "").strip()):
+                source = normalize_text(source)
+                if len(source) < 2:
+                    continue
+                if source.endswith("股份有限公司"):
+                    source = source[:-6]
+                if source.endswith("有限公司"):
+                    source = source[:-4]
+                source = re.sub(r"(集团股份有限公司|集团股份公司|股份有限公司|股份公司|集团有限公司|有限公司)$", "", source)
+                if source:
+                    for size in range(2, min(5, len(source)) + 1):
+                        fragments.add(source[:size])
+                        fragments.add(source[-size:])
+            for fragment in fragments:
+                if fragment in GENERIC_COMPANY_FRAGMENTS:
+                    continue
+                if any(token in fragment for token in ("公司", "股份", "有限")):
+                    continue
+                fragment_candidates.setdefault(fragment, []).append(payload)
+
+        aliases: dict[str, dict[str, Any]] = {}
+        for fragment, rows in fragment_candidates.items():
+            if len(rows) == 1:
+                aliases[fragment] = rows[0]
+        return aliases
+
+    def _ensure_runtime_indexes(self) -> None:
+        statements = [
+            "CREATE INDEX IF NOT EXISTS idx_document_chunks_source_stock ON document_chunks(source_type, stock_code)",
+            "CREATE INDEX IF NOT EXISTS idx_document_chunks_stock_name ON document_chunks(stock_name)",
+            "CREATE INDEX IF NOT EXISTS idx_document_chunks_report_period ON document_chunks(report_period)",
+            "CREATE INDEX IF NOT EXISTS idx_income_sheet_stock_period ON income_sheet(stock_code, report_period)",
+            "CREATE INDEX IF NOT EXISTS idx_balance_sheet_stock_period ON balance_sheet(stock_code, report_period)",
+            "CREATE INDEX IF NOT EXISTS idx_cash_flow_sheet_stock_period ON cash_flow_sheet(stock_code, report_period)",
+            "CREATE INDEX IF NOT EXISTS idx_kpi_sheet_stock_period ON core_performance_indicators_sheet(stock_code, report_period)",
+        ]
+        for statement in statements:
+            try:
+                self.database.execute(statement)
+            except Exception:
+                continue
+
     def refresh(self) -> None:
         self.company_rows = self.database.query("SELECT * FROM company_info ORDER BY stock_code")
         self.company_aliases = self._build_company_aliases()
+        self.company_code_map = self._build_company_code_map()
+        self.company_fragment_aliases = self._build_company_fragment_aliases()
         self.question_bank_rows = self._load_question_bank_rows()
 
     def _load_question_bank_rows(self) -> list[dict[str, str]]:
@@ -247,6 +367,34 @@ class FinancialQAEngine:
         text = normalize_text(text)
         return text[:limit]
 
+    def _clean_reference_snippet(self, text: str, limit: int = 120) -> str:
+        cleaned = self._clip_clean_text(text, limit=limit)
+        if len(cleaned) < 12:
+            return ""
+        if self._bad_text_ratio(cleaned) > 0.08:
+            return ""
+        digit_ratio = sum(1 for char in cleaned if char.isdigit()) / max(len(cleaned), 1)
+        if digit_ratio > 0.55 and not any("\u4e00" <= char <= "\u9fff" for char in cleaned):
+            return ""
+        return cleaned
+
+    def _dedupe_references(self, references: list[dict[str, str]], limit: int = 3) -> list[dict[str, str]]:
+        cleaned_items: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for reference in references:
+            paper_path = str(reference.get("paper_path") or "").strip()
+            snippet = self._clean_reference_snippet(str(reference.get("text") or ""))
+            if not paper_path or not snippet:
+                continue
+            key = (paper_path, snippet)
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned_items.append({"paper_path": paper_path, "text": snippet, "paper_image": ""})
+            if len(cleaned_items) >= limit:
+                break
+        return cleaned_items
+
     def _is_clean_sentence(self, text: str) -> bool:
         cleaned = self._clip_clean_text(text, limit=400)
         if len(cleaned) < 8:
@@ -277,20 +425,36 @@ class FinancialQAEngine:
             answers.append((question, answer))
         return answers
 
-    def answer_question(self, question: str, context: dict[str, Any] | None = None) -> AnswerPayload:
-        if context is None:
-            context = {}
-        question = normalize_text(question)
-        compact = compact_text(question)
-        detected_company = self._detect_company(question)
-        company_field = detect_company_field(question)
-        detected_metric = detect_metric(question)
-        top_k = detect_top_k(question)
-        wants_chart = self._contains_any(compact, CHART_KEYWORDS)
-        wants_trend = wants_chart or self._contains_any(compact, TREND_KEYWORDS)
-        wants_attribution = self._contains_any(compact, ATTRIBUTION_KEYWORDS)
-        wants_research = self._contains_any(compact, RESEARCH_KEYWORDS)
-        latest_requested = self._contains_any(compact, LATEST_KEYWORDS)
+    def _normalize_question(self, question: str) -> tuple[str, str]:
+        normalized = normalize_text(question)
+        return normalized, compact_text(normalized)
+
+    def _detect_metric_step(self, question: str) -> tuple[str, str, str] | None:
+        return detect_metric(question)
+
+    def _detect_period_step(
+        self,
+        question: str,
+        context: dict[str, Any],
+        follow_up: bool,
+    ) -> dict[str, str] | None:
+        return parse_period(question, context if follow_up else {})
+
+    def _resolve_context(
+        self,
+        *,
+        question: str,
+        compact: str,
+        context: dict[str, Any],
+        detected_company: dict[str, Any] | None,
+        detected_metric: tuple[str, str, str] | None,
+        company_field: tuple[str, str] | None,
+        top_k: int | None,
+        wants_trend: bool,
+        wants_attribution: bool,
+        wants_research: bool,
+        latest_requested: bool,
+    ) -> bool:
         follow_up = self._should_reuse_context(
             question=question,
             compact=compact,
@@ -306,11 +470,58 @@ class FinancialQAEngine:
         )
         if not follow_up:
             self._clear_semantic_context(context)
+        return follow_up
 
+    def _detect_query_mode(self, state: PlannedQuestionState) -> str:
+        if state.company_field:
+            return "company_profile"
+        if state.plan.wants_research:
+            return "research"
+        if state.plan.industry_query:
+            return "industry_lookup"
+        if state.plan.wants_attribution:
+            return "attribution"
+        if state.plan.top_k:
+            return "ranking"
+        if state.plan.wants_trend:
+            return "trend"
+        if state.metric or state.company:
+            return "structured"
+        return "retrieval"
+
+    def _build_question_state(self, question: str, context: dict[str, Any]) -> PlannedQuestionState:
+        normalized_question, compact = self._normalize_question(question)
+        detected_company = self._detect_company(normalized_question)
+        company_field = detect_company_field(normalized_question)
+        detected_metric = self._detect_metric_step(normalized_question)
+        top_k = detect_top_k(normalized_question)
+        wants_chart = self._contains_any(compact, CHART_KEYWORDS)
+        wants_trend = wants_chart or self._contains_any(compact, TREND_KEYWORDS)
+        wants_attribution = self._contains_any(compact, ATTRIBUTION_KEYWORDS)
+        wants_research = self._contains_any(compact, RESEARCH_KEYWORDS)
+        latest_requested = self._contains_any(compact, LATEST_KEYWORDS)
+        context_before = {
+            "company": context.get("company"),
+            "metric": context.get("metric"),
+            "period_info": context.get("period_info"),
+            "year": context.get("year"),
+        }
+        follow_up = self._resolve_context(
+            question=normalized_question,
+            compact=compact,
+            context=context,
+            detected_company=detected_company,
+            detected_metric=detected_metric,
+            company_field=company_field,
+            top_k=top_k,
+            wants_trend=wants_trend,
+            wants_attribution=wants_attribution,
+            wants_research=wants_research,
+            latest_requested=latest_requested,
+        )
         company = detected_company or context.get("company")
         metric = detected_metric or context.get("metric")
-        period_info = parse_period(question, context if follow_up else {})
-
+        period_info = self._detect_period_step(normalized_question, context, follow_up)
         if company:
             context["company"] = company
         if metric:
@@ -318,52 +529,175 @@ class FinancialQAEngine:
         if period_info:
             context["period_info"] = period_info
             context["year"] = period_info["year"]
+        plan = plan_subtasks(normalized_question)
+        debug_trace = {
+            "normalize_question": normalized_question,
+            "resolve_context": {
+                "follow_up": follow_up,
+                "context_before": context_before,
+                "context_after": {
+                    "company": bool(company),
+                    "metric": metric[2] if metric else "",
+                    "period": (period_info or {}).get("report_period", ""),
+                },
+            },
+            "detect_company": (company or {}).get("stock_abbr", "") if company else "",
+            "detect_metric": metric[2] if metric else "",
+            "detect_period": (period_info or {}).get("report_period", ""),
+            "detect_query_mode": "",
+            "plan_subtasks": [subtask.intent for subtask in plan.subtasks],
+        }
+        state = PlannedQuestionState(
+            question=normalized_question,
+            compact_question=compact,
+            plan=plan,
+            follow_up=follow_up,
+            company=company,
+            metric=metric,
+            period_info=period_info,
+            company_field=company_field,
+            context_before=context_before,
+            debug_trace=debug_trace,
+        )
+        state.debug_trace["detect_query_mode"] = self._detect_query_mode(state)
+        self.last_debug_trace = state.debug_trace
+        context["_debug_trace"] = state.debug_trace
+        return state
 
-        if company_field and company:
-            return self._answer_company_profile(company, company_field)
+    def _need_clarification(self, state: PlannedQuestionState) -> AnswerPayload | None:
+        query_mode = self._detect_query_mode(state)
+        cross_company_query = self._is_cross_company_query(state.compact_question, state.plan.top_k)
+        if not state.company and state.metric and not cross_company_query and not state.plan.industry_query and not state.plan.wants_research:
+            if query_mode == "attribution":
+                return self._answer_missing_company_clarification(state.metric[2], "归因分析")
+            if query_mode == "trend":
+                return self._answer_missing_company_clarification(state.metric[2], "趋势分析")
+            if not state.plan.wants_latest:
+                return self._answer_missing_company_clarification(state.metric[2], "指标查询")
+        if not state.company and state.plan.wants_attribution and not state.plan.industry_query:
+            return AnswerPayload(content="当前问题缺少公司名称。请先补充公司后再做归因分析，例如：华润三九主营业务收入上升的原因是什么？")
+        if state.company and not state.metric and not state.company_field and query_mode == "structured" and not state.plan.industry_query and not state.plan.wants_research:
+            return self._answer_missing_metric_clarification(state.company)
+        if (
+            state.company
+            and state.metric
+            and query_mode == "structured"
+            and not state.period_info
+            and not state.plan.wants_trend
+            and not state.plan.top_k
+            and not state.plan.wants_latest
+        ):
+            clarification = self._answer_period_clarification(state.company, state.metric)
+            if clarification:
+                return clarification
+        return None
 
-        if wants_research:
+    def _plan_subtasks(self, state: PlannedQuestionState) -> list[dict[str, Any]]:
+        return [{"intent": subtask.intent, "question": subtask.question, "params": dict(subtask.params)} for subtask in state.plan.subtasks]
+
+    def _execute_direct_question(self, state: PlannedQuestionState, context: dict[str, Any]) -> AnswerPayload:
+        company = state.company
+        metric = state.metric
+        period_info = state.period_info
+
+        if state.company_field and company:
+            return self._answer_company_profile(company, state.company_field)
+
+        if state.plan.wants_research:
             research_answer = self._answer_research(company)
             if research_answer:
                 return research_answer
 
-        medical_insurance_answer = self._answer_medical_insurance_products(question)
+        medical_insurance_answer = self._answer_medical_insurance_products(state.question)
         if medical_insurance_answer:
             return medical_insurance_answer
 
-        if top_k and "\u540c\u6bd4" in compact and "\u5229\u6da6" in compact:
-            return self._answer_profit_ranking_with_growth(period_info, top_k, context)
+        if state.plan.top_k and "同比" in state.compact_question and "利润" in state.compact_question:
+            return self._answer_profit_ranking_with_growth_v2(period_info, state.plan.top_k, context)
 
-        if wants_attribution and company and metric:
-            if metric[1] in ("main_business_revenue", "total_operating_revenue"):
-                attribution = self._answer_revenue_attribution(company)
-                if attribution:
-                    return attribution
-            retrieval_question = f"{company['stock_abbr']} {metric[2]} \u4e0a\u5347\u539f\u56e0"
-            return self._answer_retrieval(retrieval_question, company, prefer_causes=True)
+        if state.plan.wants_attribution and company and metric:
+            return self._answer_task3_attribution(state.question, company, metric, period_info)
 
         if metric:
-            if company and not period_info and not wants_trend and not top_k and not latest_requested:
-                clarification = self._answer_period_clarification(company, metric)
-                if clarification:
-                    return clarification
             structured = self._answer_structured_metric(
-                question=question,
+                question=state.question,
                 company=company,
                 metric=metric,
                 period_info=period_info,
-                wants_trend=wants_trend,
-                wants_chart=wants_chart,
-                top_k=top_k,
-                latest_requested=latest_requested,
+                wants_trend=state.plan.wants_trend,
+                wants_chart=state.plan.wants_chart,
+                top_k=state.plan.top_k,
+                latest_requested=state.plan.wants_latest,
                 context=context,
             )
             if structured:
                 return structured
 
-        if wants_attribution:
-            return self._answer_retrieval(question, company, prefer_causes=True)
-        return self._answer_retrieval(question, company, prefer_causes=False)
+        if state.plan.wants_attribution:
+            return self._answer_retrieval_v2(state.question, company, prefer_causes=True)
+        return self._answer_retrieval_v2(state.question, company, prefer_causes=False)
+
+    def _execute_subtasks(self, state: PlannedQuestionState, context: dict[str, Any]) -> list[AnswerPayload]:
+        if {"ranking", "yoy", "maxmin"}.issubset(set(state.plan.intents)) and state.plan.top_k and "利润" in state.compact_question:
+            return [self._answer_profit_ranking_with_growth_v2(state.period_info, state.plan.top_k, context)]
+
+        fragment_depth = int(context.get("_fragment_depth", 0) or 0)
+        if len(state.plan.fragments) > 1 and fragment_depth < 2:
+            fragment_context = dict(context)
+            fragment_context["_fragment_depth"] = fragment_depth + 1
+            return [self.answer_question(fragment, fragment_context) for fragment in state.plan.fragments]
+
+        return [self._execute_direct_question(state, context)]
+
+    def _assemble_answer(self, state: PlannedQuestionState, payloads: list[AnswerPayload]) -> AnswerPayload:
+        if not payloads:
+            return AnswerPayload(content="当前未检索到足够的离线证据。可以补充公司名称、报告期或指标后再提问。")
+        if len(payloads) == 1:
+            return payloads[0]
+
+        content_lines = [f"{index}. {payload.content}" for index, payload in enumerate(payloads, start=1) if payload.content]
+        sql_parts = [payload.sql for payload in payloads if payload.sql]
+        images: list[str] = []
+        chart_types: list[str] = []
+        references: list[dict[str, str]] = []
+        seen_refs: set[tuple[str, str]] = set()
+        for payload in payloads:
+            for image in payload.image:
+                if image and image not in images:
+                    images.append(image)
+            for chart_type in payload.chart_types:
+                if chart_type and chart_type not in chart_types:
+                    chart_types.append(chart_type)
+            for reference in payload.references:
+                key = (str(reference.get("paper_path") or ""), str(reference.get("text") or ""))
+                if key in seen_refs:
+                    continue
+                seen_refs.add(key)
+                references.append(reference)
+        return AnswerPayload(
+            content="\n".join(content_lines),
+            sql="\n\n".join(sql_parts),
+            image=images,
+            references=references,
+            chart_types=chart_types,
+        )
+
+    def answer_question(self, question: str, context: dict[str, Any] | None = None) -> AnswerPayload:
+        if context is None:
+            context = {}
+        state = self._build_question_state(question, context)
+        clarification = self._need_clarification(state)
+        if clarification:
+            state.debug_trace["need_clarification"] = clarification.content
+            return clarification
+        state.debug_trace["need_clarification"] = ""
+        state.debug_trace["plan_subtasks"] = self._plan_subtasks(state)
+        payloads = self._execute_subtasks(state, context)
+        answer = self._assemble_answer(state, payloads)
+        state.debug_trace["assemble_answer"] = {"content_length": len(answer.content), "reference_count": len(answer.references)}
+        self.last_debug_trace = state.debug_trace
+        context["_debug_trace"] = state.debug_trace
+        return answer
 
     def _contains_any(self, text: str, keywords: tuple[str, ...]) -> bool:
         return any(keyword in text for keyword in keywords)
@@ -372,7 +706,136 @@ class FinancialQAEngine:
         for alias, payload in sorted(self.company_aliases.items(), key=lambda item: len(item[0]), reverse=True):
             if alias and alias in question:
                 return payload
+        for alias, payload in sorted(self.company_fragment_aliases.items(), key=lambda item: len(item[0]), reverse=True):
+            if alias and alias in question:
+                return payload
         return None
+
+    def _company_label(self, stock_code: Any, fallback: str = "") -> str:
+        code = normalize_stock_code(stock_code)
+        company = self.company_code_map.get(code) if code else None
+        if company:
+            return str(company.get("stock_abbr") or company.get("company_name") or fallback)
+        return str(fallback or code or "")
+
+    def _is_cross_company_query(self, compact: str, top_k: int | None) -> bool:
+        if top_k:
+            return True
+        return any(keyword in compact for keyword in CROSS_COMPANY_KEYWORDS)
+
+    def _answer_missing_company_clarification(self, metric_label: str, scene: str) -> AnswerPayload:
+        return AnswerPayload(
+            content=(
+                f"\u5f53\u524d\u95ee\u9898\u9700\u8981\u5148\u786e\u5b9a\u516c\u53f8\u540d\u79f0\uff0c\u624d\u80fd\u8fdb\u884c{scene}\u3002"
+                f"\u6211\u5df2\u8bc6\u522b\u5230\u4f60\u5728\u95ee\u201c{metric_label}\u201d\uff0c"
+                "\u8bf7\u8865\u5145\u516c\u53f8\uff0c\u4f8b\u5982\uff1a\u534e\u6da6\u4e09\u4e5d"
+                f"{metric_label}\u4e0a\u5347\u7684\u539f\u56e0\u662f\u4ec0\u4e48\uff1f"
+            )
+        )
+
+    def _answer_missing_metric_clarification(self, company: dict[str, Any]) -> AnswerPayload:
+        return AnswerPayload(
+            content=(
+                f"当前问题已经识别到公司为{company['stock_abbr']}，但还缺少具体指标。"
+                "请补充你要查询的指标，例如：净利润、主营业务收入、总资产。"
+            )
+        )
+
+    def _attribution_target_period(
+        self,
+        company: dict[str, Any],
+        metric: tuple[str, str, str],
+        period_info: dict[str, str] | None,
+    ) -> str | None:
+        if period_info:
+            return period_info["report_period"]
+        periods = self._available_periods(metric[0], company)
+        if not periods:
+            return None
+        fy_periods = [period for period in periods if period.endswith("FY")]
+        candidates = fy_periods or periods
+        return sorted(candidates, key=sortable_period)[-1]
+
+    def _structured_attribution_conclusion(
+        self,
+        company: dict[str, Any],
+        metric: tuple[str, str, str],
+        period_info: dict[str, str] | None,
+    ) -> str:
+        table_name, column_name, metric_label = metric
+        target_period = self._attribution_target_period(company, metric, period_info)
+        if not target_period:
+            return ""
+        expr = self._metric_sql_expr(column_name)
+        value = self._load_metric_value(table_name, expr, company["stock_code"], target_period)
+        if self._is_suspicious_value(metric_label, value):
+            return ""
+        stored_yoy = self.database.scalar(
+            """
+            SELECT yoy_value
+            FROM financial_metric_facts
+            WHERE stock_code = ? AND report_period = ? AND metric_key = ?
+            LIMIT 1
+            """,
+            (company["stock_code"], target_period, column_name),
+        )
+        yoy_text, yoy_value = self._fy_yoy_display(table_name, company["stock_code"], target_period, expr, stored_yoy)
+        value_text = self._format_metric_value(metric_label, value)
+        if yoy_value is not None:
+            direction = "上升" if yoy_value >= 0 else "下降"
+            return (
+                f"从结构化数据库看，{company['stock_abbr']}{target_period}的{metric_label}为{value_text}，"
+                f"同比{direction}{abs(yoy_value):.2f}%。"
+            )
+        if yoy_text not in ("", "未知"):
+            return f"从结构化数据库看，{company['stock_abbr']}{target_period}的{metric_label}为{value_text}，同比{yoy_text}。"
+        return f"从结构化数据库看，{company['stock_abbr']}{target_period}的{metric_label}为{value_text}。"
+
+    def _answer_task3_attribution(
+        self,
+        question: str,
+        company: dict[str, Any],
+        metric: tuple[str, str, str],
+        period_info: dict[str, str] | None,
+    ) -> AnswerPayload:
+        structured_conclusion = self._structured_attribution_conclusion(company, metric, period_info)
+        if metric[1] in ("main_business_revenue", "total_operating_revenue"):
+            retrieval_payload = self._answer_revenue_attribution(company) or self._answer_retrieval_v2(
+                f"{company['stock_abbr']} {metric[2]} 上升原因",
+                company,
+                prefer_causes=True,
+            )
+        else:
+            retrieval_payload = self._answer_retrieval_v2(
+                f"{company['stock_abbr']} {metric[2]} 上升原因",
+                company,
+                prefer_causes=True,
+            )
+        references = self._dedupe_references(retrieval_payload.references, limit=3)
+        if not references:
+            content = structured_conclusion or retrieval_payload.content
+            if "不足" not in content:
+                content = content + " 当前离线证据不足以稳定支撑归因分析。"
+            return AnswerPayload(content=content, sql=retrieval_payload.sql, references=references)
+        evidence_lines = [f"{index}. {reference['text']}" for index, reference in enumerate(references, start=1)]
+        fallback_conclusion = self._clean_reference_snippet(retrieval_payload.content, limit=120) or retrieval_payload.content
+        conclusion = structured_conclusion or fallback_conclusion
+        content = conclusion + "\n证据依据：\n" + "\n".join(evidence_lines)
+        return AnswerPayload(content=content, sql=retrieval_payload.sql, references=references)
+
+    def _format_publish_date(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}.*", text):
+            return text[:10]
+        if re.fullmatch(r"\d{8}", text):
+            return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+        if re.fullmatch(r"\d+(?:\.0+)?", text):
+            serial = int(float(text))
+            if 30000 <= serial <= 70000:
+                return (datetime(1899, 12, 30) + timedelta(days=serial)).strftime("%Y-%m-%d")
+        return text[:10]
 
     def _metric_sql_expr(self, column_name: str) -> str:
         if column_name == "main_business_revenue":
@@ -459,6 +922,94 @@ class FinancialQAEngine:
         )
         return AnswerPayload(content=f"{company['stock_abbr']}\u7684{field_label}\u4e3a\uff1a{value}\u3002", sql=sql)
 
+    def _is_percentage_metric(self, metric_label: str, column_name: str) -> bool:
+        return (
+            "\u7387" in metric_label
+            or "\u540c\u6bd4" in metric_label
+            or "\u73af\u6bd4" in metric_label
+            or "\u5360\u6bd4" in metric_label
+            or column_name.endswith("_ratio")
+            or column_name.endswith("_growth")
+        )
+
+    def _parse_threshold_condition(
+        self,
+        question: str,
+        column_name: str,
+        metric_label: str,
+    ) -> tuple[str, float, str] | None:
+        compact = compact_text(question)
+        if "\u8d1f\u6570" in compact:
+            return ("<", 0.0, "\u8d1f\u6570")
+        if "\u6b63\u6570" in compact:
+            return (">", 0.0, "\u6b63\u6570")
+
+        patterns = [
+            (r"(?:\u4e0d\u5c11\u4e8e|\u4e0d\u4f4e\u4e8e|>=)([-+]?\d+(?:\.\d+)?)\s*(\u4ebf|\u4e07|%|\uff05|\u5143)?", ">="),
+            (r"(?:\u8d85\u8fc7|\u9ad8\u4e8e|\u5927\u4e8e|>)([-+]?\d+(?:\.\d+)?)\s*(\u4ebf|\u4e07|%|\uff05|\u5143)?", ">"),
+            (r"(?:\u4e0d\u8d85\u8fc7|\u4e0d\u9ad8\u4e8e|<=)([-+]?\d+(?:\.\d+)?)\s*(\u4ebf|\u4e07|%|\uff05|\u5143)?", "<="),
+            (r"(?:\u4f4e\u4e8e|\u5c11\u4e8e|\u5c0f\u4e8e|<)([-+]?\d+(?:\.\d+)?)\s*(\u4ebf|\u4e07|%|\uff05|\u5143)?", "<"),
+        ]
+        for pattern, operator in patterns:
+            match = re.search(pattern, compact)
+            if not match:
+                continue
+            number_text, unit = match.groups()
+            raw_value = to_float(f"{number_text}{unit or ''}") if unit else float(number_text)
+            if raw_value is None:
+                continue
+            if unit and not self._is_percentage_metric(metric_label, column_name) and self._is_amount_metric(metric_label):
+                raw_value /= 10000.0
+            return operator, raw_value, f"{operator} {number_text}{unit or ''}".strip()
+        return None
+
+    def _answer_threshold_filter(
+        self,
+        table_name: str,
+        column_name: str,
+        metric_label: str,
+        period_info: dict[str, str] | None,
+        question: str,
+    ) -> AnswerPayload | None:
+        threshold = self._parse_threshold_condition(question, column_name, metric_label)
+        if threshold is None:
+            return None
+        operator, threshold_value, threshold_label = threshold
+        expr = self._metric_sql_expr(column_name)
+        period = period_info["report_period"] if period_info else self._latest_fy_period()
+        sql = (
+            "SELECT stock_code, stock_abbr, report_period, "
+            f"{expr} AS metric_value FROM {table_name} WHERE report_period = {self._quote(period)} "
+            f"AND {expr} {operator} {threshold_value} ORDER BY metric_value DESC LIMIT 50"
+        )
+        rows = self.database.query(
+            f"""
+            SELECT stock_code, stock_abbr, report_period, {expr} AS metric_value
+            FROM {table_name}
+            WHERE report_period = ? AND {expr} {operator} ?
+            ORDER BY metric_value DESC
+            LIMIT 50
+            """,
+            (period, threshold_value),
+        )
+        valid_rows = []
+        for row in rows:
+            value = to_float(row["metric_value"])
+            if value is None:
+                continue
+            valid_rows.append((str(row["stock_code"] or ""), self._company_label(row["stock_code"], str(row["stock_abbr"] or "")), value))
+        if not valid_rows:
+            return AnswerPayload(content=f"{period}\u6ca1\u6709\u547d\u4e2d{metric_label}{threshold_label}\u7684\u516c\u53f8\u3002", sql=sql)
+
+        lines = [
+            f"{index}. {name}（{code}）: {self._format_metric_value(metric_label, value)}"
+            for index, (code, name, value) in enumerate(valid_rows, start=1)
+        ]
+        return AnswerPayload(
+            content=f"{period}\u547d\u4e2d{metric_label}{threshold_label}\u7684\u516c\u53f8\u5171 {len(valid_rows)} \u5bb6\uff1a\n" + "\n".join(lines),
+            sql=sql,
+        )
+
     def _text_cjk_ratio(self, text: str) -> float:
         meaningful = [char for char in text if not char.isspace()]
         if not meaningful:
@@ -531,14 +1082,15 @@ class FinancialQAEngine:
             lines = []
             for row in rows[:5]:
                 suffix = f"\uff0c\u8bc4\u7ea7\uff1a{row['emRatingName']}" if row["emRatingName"] else ""
-                lines.append(f"{row['publishDate'][:10]} {row['orgName']}\u300a{row['title']}\u300b{suffix}")
+                publish_date = self._format_publish_date(row["publishDate"])
+                lines.append(f"{publish_date} {row['orgName']}\u300a{row['title']}\u300b{suffix}".strip())
             return AnswerPayload(content=f"\u68c0\u7d22\u5230\u4e0e{company['stock_abbr']}\u76f8\u5173\u7684\u7814\u62a5\u5982\u4e0b\uff1a\n" + "\n".join(lines), sql=sql)
 
         sql = "SELECT title, orgName, publishDate FROM industry_research ORDER BY publishDate DESC"
         rows = self.database.query(sql)
         if not rows:
             return None
-        lines = [f"{row['publishDate'][:10]} {row['orgName']}\u300a{row['title']}\u300b" for row in rows[:5]]
+        lines = [f"{self._format_publish_date(row['publishDate'])} {row['orgName']}\u300a{row['title']}\u300b".strip() for row in rows[:5]]
         return AnswerPayload(content="\u68c0\u7d22\u5230\u884c\u4e1a\u4fa7\u76f8\u5173\u7814\u62a5\u5982\u4e0b\uff1a\n" + "\n".join(lines), sql=sql)
 
     def _answer_structured_metric(
@@ -559,13 +1111,15 @@ class FinancialQAEngine:
         if self.database.table_row_count(table_name) == 0:
             return None
         if top_k:
-            return self._answer_top_k(table_name, column_name, metric_label, period_info, top_k, context)
+            return self._answer_top_k_v2(table_name, column_name, metric_label, period_info, top_k, context)
         if wants_trend and company:
             return self._answer_trend(question, table_name, column_name, metric_label, company, wants_chart, context)
         if company and period_info:
             return self._answer_scalar(table_name, column_name, metric_label, company, period_info)
         if company and latest_requested:
             return self._answer_latest_scalar(table_name, column_name, metric_label, company)
+        if not company:
+            return self._answer_threshold_filter_v2(table_name, column_name, metric_label, period_info, question)
         return None
 
     def _answer_scalar(
@@ -588,7 +1142,7 @@ class FinancialQAEngine:
         )
         value = rows[0]["metric_value"] if rows else None
         if self._is_suspicious_value(metric_label, value):
-            return self._answer_retrieval(
+            return self._answer_retrieval_v2(
                 f"{company['stock_abbr']} {period_info['label']} {metric_label}",
                 company,
                 prefer_causes=False,
@@ -615,7 +1169,7 @@ class FinancialQAEngine:
             (company["stock_code"],),
         )
         if not rows or self._is_suspicious_value(metric_label, rows[0]["metric_value"]):
-            return self._answer_retrieval(f"{company['stock_abbr']} {metric_label}", company, False, sql)
+            return self._answer_retrieval_v2(f"{company['stock_abbr']} {metric_label}", company, False, sql)
         row = rows[0]
         value_text = self._format_metric_value(metric_label, row["metric_value"])
         return AnswerPayload(content=f"{company['stock_abbr']}\u6700\u8fd1\u4e00\u671f\uff08{row['report_period']}\uff09\u7684{metric_label}\u4e3a\uff1a{value_text}\u3002", sql=sql)
@@ -746,7 +1300,7 @@ class FinancialQAEngine:
         elif len(series) > 6 and not use_all_periods:
             series = series[-6:]
         if not series:
-            return self._answer_retrieval(f"{company['stock_abbr']} {metric_label} 变化趋势", company, False, base_sql)
+            return self._answer_retrieval_v2(f"{company['stock_abbr']} {metric_label} 变化趋势", company, False, base_sql)
 
         labels = [item[0] for item in series]
         values = [item[1] for item in series]
@@ -1093,6 +1647,560 @@ class FinancialQAEngine:
         content = prefix + (" ".join(summary_sentences[:3]))
         return AnswerPayload(content=content, sql=sql, references=references)
 
+    def _answer_threshold_filter_v2(
+        self,
+        table_name: str,
+        column_name: str,
+        metric_label: str,
+        period_info: dict[str, str] | None,
+        question: str,
+    ) -> AnswerPayload | None:
+        threshold = self._parse_threshold_condition(question, column_name, metric_label)
+        if threshold is None:
+            return None
+        operator, threshold_value, threshold_label = threshold
+        expr = self._metric_sql_expr(column_name)
+        period = period_info["report_period"] if period_info else self._latest_fy_period()
+        sql = (
+            "SELECT stock_code, stock_abbr, report_period, "
+            f"{expr} AS metric_value FROM {table_name} WHERE report_period = {self._quote(period)} "
+            f"AND {expr} {operator} {threshold_value} ORDER BY metric_value DESC LIMIT 50"
+        )
+        rows = self.database.query(
+            f"""
+            SELECT stock_code, stock_abbr, report_period, {expr} AS metric_value
+            FROM {table_name}
+            WHERE report_period = ? AND {expr} {operator} ?
+            ORDER BY metric_value DESC
+            LIMIT 50
+            """,
+            (period, threshold_value),
+        )
+        valid_rows: list[tuple[str, str, float]] = []
+        for row in rows:
+            value = to_float(row["metric_value"])
+            if value is None:
+                continue
+            valid_rows.append(
+                (
+                    str(row["stock_code"] or ""),
+                    self._company_label(row["stock_code"], str(row["stock_abbr"] or "")),
+                    value,
+                )
+            )
+        if not valid_rows:
+            return AnswerPayload(content=f"{period}没有命中{metric_label}{threshold_label}的公司。", sql=sql)
+
+        lines = [
+            f"{index}. {name}（{code}）: {self._format_metric_value(metric_label, value)}"
+            for index, (code, name, value) in enumerate(valid_rows, start=1)
+        ]
+        return AnswerPayload(
+            content=f"{period}命中{metric_label}{threshold_label}的公司共 {len(valid_rows)} 家：\n" + "\n".join(lines),
+            sql=sql,
+        )
+
+    def _answer_top_k_v2(
+        self,
+        table_name: str,
+        column_name: str,
+        metric_label: str,
+        period_info: dict[str, str] | None,
+        top_k: int,
+        context: dict[str, Any],
+    ) -> AnswerPayload:
+        expr = self._metric_sql_expr(column_name)
+        period = period_info["report_period"] if period_info else self._latest_fy_period()
+        sql = (
+            f"SELECT stock_code, stock_abbr, report_period, {expr} AS metric_value FROM {table_name} "
+            f"WHERE report_period = {self._quote(period)} ORDER BY metric_value DESC LIMIT {top_k}"
+        )
+        rows = self.database.query(
+            f"""
+            SELECT stock_code, stock_abbr, report_period, {expr} AS metric_value
+            FROM {table_name}
+            WHERE report_period = ?
+            ORDER BY metric_value DESC
+            LIMIT ?
+            """,
+            (period, top_k),
+        )
+        valid_rows: list[tuple[str, str, float]] = []
+        for row in rows:
+            value = to_float(row["metric_value"])
+            if value is None:
+                continue
+            if self._is_amount_metric(metric_label) and abs(value) < 1:
+                continue
+            valid_rows.append(
+                (
+                    str(row["stock_code"] or ""),
+                    self._company_label(row["stock_code"], str(row["stock_abbr"] or "")),
+                    value,
+                )
+            )
+        if not valid_rows:
+            return self._answer_retrieval_v2(f"{metric_label} top {top_k}", None, False, sql)
+
+        relative_path = self._save_chart(
+            "bar",
+            context,
+            f"{metric_label} Top{top_k}",
+            [item[1] for item in valid_rows],
+            [item[2] for item in valid_rows],
+            metric_label + period + "_ranking",
+        )
+        summary = "；".join(
+            f"{index + 1}. {name}（{code}）: {self._format_metric_value(metric_label, value)}"
+            for index, (code, name, value) in enumerate(valid_rows)
+        )
+        images = [relative_path] if relative_path else []
+        chart_types = [self._chart_type_label("bar")] if relative_path else []
+        return AnswerPayload(
+            content=f"{period}的{metric_label}排名结果如下：{summary}。",
+            sql=sql,
+            image=images,
+            chart_types=chart_types,
+        )
+
+    def _answer_profit_ranking_with_growth_v2(
+        self,
+        period_info: dict[str, str] | None,
+        top_k: int,
+        context: dict[str, Any],
+    ) -> AnswerPayload:
+        latest_period = self._latest_fy_period()
+        year = period_info["year"] if period_info else latest_period[:4]
+        period = f"{year}FY"
+        total_profit_count = int(
+            self.database.scalar(
+                "SELECT COUNT(1) FROM income_sheet WHERE report_period = ? AND total_profit IS NOT NULL AND ABS(total_profit) >= 1",
+                (period,),
+            )
+            or 0
+        )
+        metric_column = "total_profit" if total_profit_count >= 2 else "net_profit"
+        profit_yoy_expr = (
+            "COALESCE(total_profit_yoy_growth, net_profit_yoy_growth)"
+            if metric_column == "total_profit"
+            else "net_profit_yoy_growth"
+        )
+        sales_yoy_expr = "COALESCE(main_business_revenue_yoy_growth, operating_revenue_yoy_growth)"
+        sql = (
+            "SELECT stock_code, stock_abbr, "
+            f"{metric_column} AS profit_value, {profit_yoy_expr} AS profit_yoy, {sales_yoy_expr} AS sales_yoy "
+            f"FROM income_sheet WHERE report_period = {self._quote(period)} ORDER BY profit_value DESC LIMIT {top_k}"
+        )
+        rows = self.database.query(
+            f"""
+            SELECT stock_code,
+                   stock_abbr,
+                   {metric_column} AS profit_value,
+                   {profit_yoy_expr} AS profit_yoy,
+                   {sales_yoy_expr} AS sales_yoy
+            FROM income_sheet
+            WHERE report_period = ?
+            ORDER BY profit_value DESC
+            LIMIT ?
+            """,
+            (period, top_k),
+        )
+        valid_rows = []
+        for row in rows:
+            profit_value = to_float(row["profit_value"])
+            if profit_value is None or abs(profit_value) < 1:
+                continue
+            valid_rows.append(row)
+        if not valid_rows:
+            return self._answer_retrieval_v2(f"{year}年利润排名及同比", None, False, sql)
+
+        relative_path = self._save_chart(
+            "bar",
+            context,
+            f"{year}年利润排名",
+            [self._company_label(row["stock_code"], str(row["stock_abbr"] or "")) for row in valid_rows],
+            [to_float(row["profit_value"]) or 0.0 for row in valid_rows],
+            period + "_top_profit",
+        )
+
+        yoy_candidates: list[tuple[dict[str, Any], float]] = []
+        ranking_lines: list[str] = []
+        for index, row in enumerate(valid_rows, start=1):
+            display_name = self._company_label(row["stock_code"], str(row["stock_abbr"] or ""))
+            profit = format_money_from_10k(row["profit_value"])
+            profit_yoy_text, profit_yoy_value = self._fy_yoy_display(
+                "income_sheet",
+                str(row["stock_code"]),
+                period,
+                metric_column,
+                row["profit_yoy"],
+            )
+            sales_yoy_text, _ = self._fy_yoy_display(
+                "income_sheet",
+                str(row["stock_code"]),
+                period,
+                "COALESCE(main_business_revenue, total_operating_revenue)",
+                row["sales_yoy"],
+            )
+            if profit_yoy_value is not None:
+                yoy_candidates.append((row, profit_yoy_value))
+            ranking_lines.append(
+                f"{index}. {display_name}：利润 {profit}，利润同比 {profit_yoy_text}，营收同比 {sales_yoy_text}"
+            )
+
+        best_pair = max(yoy_candidates, key=lambda item: item[1]) if yoy_candidates else None
+        if best_pair is not None:
+            best_name = self._company_label(best_pair[0]["stock_code"], str(best_pair[0]["stock_abbr"] or ""))
+            suffix = f"利润同比增幅最高的是{best_name}，为 {best_pair[1]:.2f}%。"
+        else:
+            suffix = "当前可抽取数据中未能稳定识别全部利润同比。"
+        metric_name = "利润总额" if metric_column == "total_profit" else "净利润"
+        available_count = len(valid_rows)
+        if available_count < top_k:
+            prefix = f"{year}年当前数据库中可用于该问题统计的企业共 {available_count} 家，按{metric_name}口径排序结果如下："
+        else:
+            prefix = f"{year}年按{metric_name}口径统计的 Top{top_k} 企业如下："
+
+        images = [relative_path] if relative_path else []
+        chart_types = [self._chart_type_label("bar")] if relative_path else []
+        return AnswerPayload(
+            content=prefix + "\n" + "\n".join(ranking_lines) + "\n" + suffix,
+            sql=sql,
+            image=images,
+            chart_types=chart_types,
+        )
+
+    def _extract_retrieval_terms_v2(self, question: str, company: dict[str, Any] | None = None) -> list[str]:
+        metric = detect_metric(question)
+        period_info = parse_period(question)
+        raw_terms: list[str] = []
+        if metric:
+            raw_terms.append(metric[2])
+        if period_info:
+            raw_terms.extend([period_info["year"], period_info["report_period"]])
+        raw_terms.extend(re.findall(r"[\u4e00-\u9fff]{2,8}|[A-Za-z0-9_.%-]+", normalize_text(question)))
+        if company:
+            raw_terms.extend(
+                [
+                    str(company.get("stock_abbr") or ""),
+                    str(company.get("company_name") or ""),
+                    normalize_stock_code(company.get("stock_code")),
+                ]
+            )
+
+        terms: list[str] = []
+        seen: set[str] = set()
+        for raw_term in raw_terms:
+            text = compact_text(str(raw_term or ""))
+            if not text:
+                continue
+            variants = [text]
+            if re.fullmatch(r"[\u4e00-\u9fff]+", text):
+                if len(text) >= 4:
+                    variants.extend([text[:4], text[-4:]])
+                if len(text) > 2:
+                    variants.extend(text[index : index + 2] for index in range(len(text) - 1))
+            else:
+                variants = [text.lower()]
+            for variant in variants:
+                if len(variant) < 2:
+                    continue
+                if variant in RETRIEVAL_STOPWORDS:
+                    continue
+                if variant.isdigit() and len(variant) < 4:
+                    continue
+                if variant in seen:
+                    continue
+                seen.add(variant)
+                terms.append(variant)
+                if len(terms) >= 8:
+                    return terms
+        return terms
+
+    def _retrieval_source_priority_v2(
+        self,
+        source_type: str,
+        prefer_causes: bool,
+        industry_query: bool,
+        product_query: bool,
+    ) -> int:
+        if product_query or industry_query:
+            order = {
+                "industry_research_pdf": 1,
+                "industry_research_meta": 2,
+                "stock_research_pdf": 3,
+                "stock_research_meta": 4,
+                "financial_report_pdf": 5,
+            }
+        elif prefer_causes:
+            order = {
+                "stock_research_pdf": 1,
+                "stock_research_meta": 2,
+                "financial_report_pdf": 3,
+                "industry_research_pdf": 4,
+                "industry_research_meta": 5,
+            }
+        else:
+            order = {
+                "stock_research_pdf": 1,
+                "financial_report_pdf": 2,
+                "stock_research_meta": 3,
+                "industry_research_pdf": 4,
+                "industry_research_meta": 5,
+            }
+        return order.get(str(source_type or ""), 9)
+
+    def _load_retrieval_candidates_v2(
+        self,
+        question: str,
+        company: dict[str, Any] | None,
+        prefer_causes: bool,
+        industry_query: bool,
+        product_query: bool,
+    ) -> tuple[list[Any], str, list[str]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        display_conditions: list[str] = []
+
+        if company:
+            conditions.append("(stock_code = ? OR stock_name IN (?, ?))")
+            params.extend([company["stock_code"], company["stock_abbr"], company["company_name"]])
+            display_conditions.append(
+                "("
+                f"stock_code = {self._quote(company['stock_code'])} OR "
+                f"stock_name IN ({self._quote(company['stock_abbr'])}, {self._quote(company['company_name'])})"
+                ")"
+            )
+
+        source_types: list[str] = []
+        compact = compact_text(question)
+        if product_query:
+            source_types = ["industry_research_pdf", "industry_research_meta"]
+        elif industry_query:
+            source_types = ["industry_research_pdf", "industry_research_meta", "stock_research_pdf", "stock_research_meta"]
+        elif prefer_causes:
+            source_types = ["stock_research_pdf", "stock_research_meta", "financial_report_pdf"]
+        elif "研报" in compact:
+            source_types = ["stock_research_pdf", "stock_research_meta", "industry_research_pdf", "industry_research_meta"]
+        if source_types:
+            placeholders = ", ".join("?" for _ in source_types)
+            conditions.append(f"source_type IN ({placeholders})")
+            params.extend(source_types)
+            display_conditions.append("source_type IN (" + ", ".join(self._quote(item) for item in source_types) + ")")
+
+        period_info = parse_period(question)
+        if period_info and not industry_query:
+            conditions.append("(report_period = ? OR report_period LIKE ?)")
+            params.extend([period_info["report_period"], f"{period_info['year']}%"])
+            display_conditions.append(
+                f"(report_period = {self._quote(period_info['report_period'])} "
+                f"OR report_period LIKE {self._quote(period_info['year'] + '%')})"
+            )
+
+        terms = self._extract_retrieval_terms_v2(question, company)
+        like_terms = terms[:6]
+        if like_terms:
+            like_conditions: list[str] = []
+            display_like_conditions: list[str] = []
+            for term in like_terms:
+                like_conditions.append("(title LIKE ? OR text LIKE ?)")
+                params.extend([f"%{term}%", f"%{term}%"])
+                display_like_conditions.append(
+                    f"(title LIKE {self._quote('%' + term + '%')} OR text LIKE {self._quote('%' + term + '%')})"
+                )
+            conditions.append("(" + " OR ".join(like_conditions) + ")")
+            display_conditions.append("(" + " OR ".join(display_like_conditions) + ")")
+
+        base_sql = "SELECT source_type, title, stock_code, stock_name, report_period, file_path, text FROM document_chunks"
+        if conditions:
+            base_sql += " WHERE " + " AND ".join(conditions)
+        display_sql = base_sql
+        if display_conditions:
+            display_sql = (
+                "SELECT source_type, title, stock_code, stock_name, report_period, file_path, text "
+                "FROM document_chunks WHERE " + " AND ".join(display_conditions)
+            )
+
+        priority_order = (
+            "CASE source_type "
+            "WHEN 'stock_research_pdf' THEN 1 "
+            "WHEN 'stock_research_meta' THEN 2 "
+            "WHEN 'financial_report_pdf' THEN 3 "
+            "WHEN 'industry_research_pdf' THEN 4 "
+            "WHEN 'industry_research_meta' THEN 5 "
+            "ELSE 9 END"
+        )
+        limit = 600 if company else (400 if industry_query or prefer_causes else 300)
+        query_sql = f"{base_sql} ORDER BY {priority_order}, report_period DESC, chunk_index ASC LIMIT ?"
+        rows = self.database.query(query_sql, (*params, limit))
+        display_sql = f"{display_sql} ORDER BY {priority_order}, report_period DESC, chunk_index ASC LIMIT {limit}"
+        return rows, display_sql, like_terms
+
+    def _answer_retrieval_v2(
+        self,
+        question: str,
+        company: dict[str, Any] | None,
+        prefer_causes: bool,
+        sql: str = "",
+    ) -> AnswerPayload:
+        compact = compact_text(question)
+        industry_query = self._contains_any(compact, INDUSTRY_QUERY_KEYWORDS)
+        product_query = industry_query and self._contains_any(compact, PRODUCT_QUERY_KEYWORDS)
+        rows, candidate_sql, query_terms = self._load_retrieval_candidates_v2(
+            question,
+            company,
+            prefer_causes,
+            industry_query,
+            product_query,
+        )
+        if not sql:
+            sql = candidate_sql
+
+        scored: list[tuple[float, Any]] = []
+        for row in rows:
+            row_text = str(row["text"] or "")
+            if row["source_type"] in ("financial_report_pdf", "industry_research_pdf", "stock_research_pdf") and self._bad_text_ratio(row_text) > 0.22:
+                continue
+            combined_text = f"{row['title']} {row_text}"
+            score = score_text(question, combined_text)
+            term_overlap = sum(1 for term in query_terms if term and term in combined_text)
+            score += min(term_overlap, 4) * 1.2
+            if company and row["stock_code"] == company["stock_code"]:
+                score += 5.0
+            elif company and row["stock_name"] in (company["stock_abbr"], company["company_name"]):
+                score += 3.0
+            if industry_query and row["source_type"] in ("industry_research_meta", "industry_research_pdf"):
+                score += 4.0
+            if industry_query and row["source_type"] == "financial_report_pdf":
+                score -= 3.0
+            if product_query and row["source_type"] == "financial_report_pdf":
+                score -= 4.0
+            if industry_query and any(keyword in row_text for keyword in ("医保", "目录", "谈判", "新增")):
+                score += 3.0
+            if "研报" in compact and "research" in str(row["source_type"]):
+                score += 2.0
+            if prefer_causes and row["source_type"] in ("stock_research_pdf", "stock_research_meta"):
+                score += 3.0
+            if prefer_causes and row["source_type"] == "financial_report_pdf":
+                score -= 1.0
+            cause_hits = sum(1 for keyword in CAUSE_KEYWORDS if keyword in row_text)
+            if prefer_causes and cause_hits:
+                score += min(cause_hits, 2) * 1.5
+            if prefer_causes and cause_hits == 0:
+                score -= 2.0
+            minimum_score = 3.0 if prefer_causes else 2.0
+            if score >= minimum_score:
+                scored.append((score, row))
+
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                -self._retrieval_source_priority_v2(item[1]["source_type"], prefer_causes, industry_query, product_query),
+            ),
+            reverse=True,
+        )
+        top_rows = [row for _, row in scored[:5]]
+
+        if not top_rows and industry_query:
+            titles = self.database.query("SELECT title, publishDate, orgName FROM industry_research ORDER BY publishDate DESC LIMIT 3")
+            if titles:
+                lines = [f"{self._format_publish_date(row['publishDate'])} {row['orgName']}《{row['title']}》" for row in titles]
+                content = "已命中本地行业研报元数据，但当前离线环境下该行业研报正文抽取不足，暂时无法稳定列出全部产品名称。可先参考相关研报题名：\n" + "\n".join(lines)
+                return AnswerPayload(content=content, sql=sql)
+
+        if not top_rows:
+            return AnswerPayload(content="当前未检索到足够的离线证据。可以补充公司名称、报告期或指标后再提问。", sql=sql)
+
+        references: list[dict[str, str]] = []
+        summary_sentences: list[str] = []
+        cause_reference_count = 0
+        for row in top_rows:
+            sentences = [sentence for sentence in split_sentences(str(row["text"])) if self._is_clean_sentence(sentence)]
+            chosen: list[str] = []
+            if industry_query:
+                chosen = [
+                    sentence
+                    for sentence in sentences
+                    if any(keyword in sentence for keyword in ("医保", "目录", "谈判", "新增", "中药"))
+                    and (not query_terms or any(term in sentence for term in query_terms))
+                ]
+            if prefer_causes and not chosen:
+                chosen = [
+                    sentence
+                    for sentence in sentences
+                    if any(keyword in sentence for keyword in CAUSE_KEYWORDS)
+                    and (not query_terms or any(term in sentence for term in query_terms))
+                ]
+            if not chosen:
+                ranked_sentences = [
+                    (
+                        score_text(question, sentence) + sum(1 for term in query_terms if term and term in sentence),
+                        sentence,
+                    )
+                    for sentence in sentences
+                ]
+                ranked_sentences = [item for item in ranked_sentences if item[0] > 0]
+                ranked_sentences.sort(key=lambda item: item[0], reverse=True)
+                chosen = [sentence for _, sentence in ranked_sentences[:3]]
+            title_text = str(row["title"] or "")
+            if not chosen and self._is_clean_sentence(title_text) and (
+                not query_terms or any(term in title_text for term in query_terms)
+            ):
+                chosen = [title_text]
+            chosen_limit = 1 if prefer_causes else 2
+            snippet = self._clean_reference_snippet(" ".join(chosen[:chosen_limit]), limit=120)
+            if not snippet:
+                continue
+            if prefer_causes and any(keyword in snippet for keyword in CAUSE_KEYWORDS):
+                cause_reference_count += 1
+            references.append({"paper_path": row["file_path"] or row["title"], "text": snippet, "paper_image": ""})
+            if snippet not in summary_sentences:
+                summary_sentences.append(snippet)
+
+        references = self._dedupe_references(references, limit=3)
+        summary_sentences = [reference["text"] for reference in references if reference.get("text")] or summary_sentences
+
+        if not summary_sentences:
+            if industry_query:
+                titles = []
+                for row in top_rows:
+                    title = self._clip_clean_text(str(row["title"]), limit=120)
+                    if title and title not in titles:
+                        titles.append(title)
+                if titles:
+                    content = "当前本地行业研报正文抽取不足，无法稳定列出完整产品名单。可先参考这些相关题名：" + "；".join(titles[:3])
+                    return AnswerPayload(content=content, sql=sql, references=references)
+            return AnswerPayload(content="当前未检索到足够的离线证据。可以补充公司名称、报告期或指标后再提问。", sql=sql)
+
+        if product_query:
+            product_sentences = [sentence for sentence in summary_sentences if "、" in sentence and "新增" in sentence]
+            if not product_sentences:
+                titles = []
+                for row in top_rows:
+                    title = str(row["title"] or "")
+                    if title and title not in titles:
+                        titles.append(title)
+                title_text = "；".join(titles[:3])
+                content = "当前本地研报正文抽取不足，无法稳定枚举“国家医保目录新增的中药产品”名单。当前可参考的证据来源为：" + title_text
+                return AnswerPayload(content=content, sql=sql, references=references)
+
+        if prefer_causes and cause_reference_count == 0:
+            return AnswerPayload(
+                content="当前检索到的离线证据不足以稳定支持归因分析。建议补充公司名称、报告期或更具体的指标后再提问。",
+                sql=sql,
+                references=references,
+            )
+
+        if prefer_causes:
+            conclusion = summary_sentences[0]
+            evidence_text = "；".join(reference["text"] for reference in references[:2])
+            content = f"结论：{conclusion}"
+            if evidence_text:
+                content += f"\n证据依据：{evidence_text}"
+        else:
+            content = " ".join(summary_sentences[:3])
+        return AnswerPayload(content=content, sql=sql, references=references)
+
     def _export_variant(self, question_file: Path, output_file: Path, rows: list[dict[str, str]]) -> str:
         id_key = "编号"
         name_text = f"{question_file.name} {output_file.name}"
@@ -1105,14 +2213,89 @@ class FinancialQAEngine:
             return "task2"
         if question_ids and all(question_id.startswith("B2") for question_id in question_ids):
             return "task3"
-        return "default"
+        return "task2"
 
     def _export_headers(self, variant: str) -> list[str]:
         if variant == "task2":
             return ["编号", "问题", "SQL查询语句", "图形格式", "回答"]
         if variant == "task3":
             return ["编号", "问题", "SQL查询语句", "回答"]
-        return ["编号", "问题类型", "问题", "SQL查询语句", "图形格式", "回答"]
+        return ["编号", "问题", "SQL查询语句", "图形格式", "回答"]
+
+    def _normalize_chart_type(self, chart_type: str) -> str:
+        text = normalize_text(str(chart_type or "")).lower()
+        if "line" in text or "折线" in text:
+            return "折线图"
+        if "bar" in text or "柱状" in text:
+            return "柱状图"
+        return ""
+
+    def _export_chart_cell_value(self, chart_types: list[str]) -> str:
+        for chart_type in chart_types:
+            normalized = self._normalize_chart_type(chart_type)
+            if normalized:
+                return normalized
+        return "无"
+
+    def _export_image_destination(self, question_id: str, seq: int) -> tuple[Path, str]:
+        file_name = f"{question_id}_{seq}.jpg"
+        return self.config.artifact_dir / file_name, f"./result/{file_name}"
+
+    def _copy_export_image(self, image: str, question_id: str, seq: int) -> str | None:
+        if not question_id:
+            return None
+        image_text = str(image or "").strip()
+        if not image_text:
+            return None
+        normalized_path = image_text[2:] if image_text.startswith("./") else image_text
+        src = self.config.workspace_root / normalized_path
+        if not src.exists():
+            return None
+        dst, export_path = self._export_image_destination(question_id, seq)
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
+        return export_path
+
+    def _clean_export_reference(self, reference: Any) -> dict[str, str]:
+        if not isinstance(reference, dict):
+            return {}
+        cleaned_reference: dict[str, str] = {}
+        for key in ("paper_path", "text", "paper_image"):
+            value = reference.get(key)
+            if value:
+                cleaned_reference[key] = str(value)
+        return cleaned_reference
+
+    def _build_export_answer_record(
+        self,
+        *,
+        variant: str,
+        question: str,
+        payload: AnswerPayload,
+        question_id: str,
+        seq: int,
+    ) -> tuple[dict[str, Any], str]:
+        export_images: list[str] = []
+        for image in payload.image:
+            export_path = self._copy_export_image(str(image), question_id, seq)
+            if export_path and export_path not in export_images:
+                export_images.append(export_path)
+
+        export_answer: dict[str, Any] = {"content": str(payload.content or "")}
+        if export_images:
+            export_answer["image"] = export_images
+
+        if variant == "task3":
+            export_references: list[dict[str, str]] = []
+            for reference in payload.references:
+                cleaned_reference = self._clean_export_reference(reference)
+                if cleaned_reference:
+                    export_references.append(cleaned_reference)
+            if export_references:
+                export_answer["references"] = export_references
+
+        chart_value = self._export_chart_cell_value(payload.chart_types)
+        return {"Q": question, "A": export_answer}, chart_value
 
     def batch_export(self, question_file: Path, output_file: Path) -> Path:
         from .xlsx_tools import read_workbook, rows_to_dicts, write_simple_xlsx
@@ -1133,49 +2316,29 @@ class FinancialQAEngine:
             question_id = str(row.get(id_key, "")).strip()
             answers = self._answer_items(row.get(question_key, ""), question_id=question_id)
             sql_lines: list[str] = []
-            chart_lines: list[str] = []
+            chart_value = "无"
             export_answers: list[dict[str, Any]] = []
             for index, (question, payload) in enumerate(answers, start=1):
                 if payload.sql:
                     sql_lines.append(str(payload.sql))
-                export_images: list[str] = []
-                for image in payload.image:
-                    src = self.config.workspace_root / str(image)
-                    if src.exists() and question_id:
-                        dst = self.config.artifact_dir / f"{question_id}_{index}{src.suffix}"
-                        if src.resolve() != dst.resolve():
-                            shutil.copy2(src, dst)
-                        export_images.append(ensure_relative_path(dst, self.config.workspace_root))
-                    elif src.exists():
-                        export_images.append(str(image))
-                for chart_type in payload.chart_types:
-                    if chart_type and chart_type not in chart_lines:
-                        chart_lines.append(chart_type)
-                export_references: list[dict[str, str]] = []
-                for reference in payload.references:
-                    if not isinstance(reference, dict):
-                        continue
-                    cleaned_reference: dict[str, str] = {}
-                    for key in ("paper_path", "text", "paper_image"):
-                        value = reference.get(key)
-                        if value:
-                            cleaned_reference[key] = str(value)
-                    if cleaned_reference:
-                        export_references.append(cleaned_reference)
-                export_answer: dict[str, Any] = {"content": payload.content}
-                if export_images:
-                    export_answer["image"] = export_images
-                if export_references:
-                    export_answer["references"] = export_references
-                export_answers.append({"Q": question, "A": export_answer})
+                export_record, current_chart = self._build_export_answer_record(
+                    variant=variant,
+                    question=question,
+                    payload=payload,
+                    question_id=question_id,
+                    seq=index,
+                )
+                if chart_value == "无" and current_chart != "无":
+                    chart_value = current_chart
+                export_answers.append(export_record)
             row_map: dict[str, object] = {
                 id_key: question_id,
                 type_key: row.get(type_key, ""),
                 question_key: row.get(question_key, ""),
                 sql_key: "\n".join(sql_lines),
-                chart_key: "\n".join(chart_lines),
+                chart_key: chart_value if variant == "task2" else "",
                 answer_key: dump_json(export_answers),
             }
             output_rows.append([row_map[header] for header in headers])
-        write_simple_xlsx(output_file, "答案结果", output_rows)
+        write_simple_xlsx(output_file, "答案结果", output_rows, column_count=len(headers))
         return output_file

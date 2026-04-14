@@ -10,7 +10,7 @@ try:
 except Exception:  # pragma: no cover - optional runtime dependency
     PdfReader = None
 
-from .utils import normalize_text
+from .utils import normalize_report_period, normalize_text
 
 
 _TEXT_PATTERN = re.compile(
@@ -269,12 +269,33 @@ def _collapse_spaced_text(text: str) -> str:
         text = updated
 
 
+def _stabilize_numeric_boundaries(text: str) -> str:
+    patterns = [
+        r"(?<=\.\d{2})(?=-?\d{1,3},)",
+        r"(?<=\.\d{2})(?=-?\d+\.\d{2,4}%?)",
+        r"(?<=\.\d{4})(?=-?\d{1,3},)",
+        r"(?<=\.\d{4})(?=-?\d+\.\d{2,4}%?)",
+        r"(?<=\.\d{2})(?=20\d{2}(?:\D|$))",
+        r"(?<=\.\d{4})(?=20\d{2}(?:\D|$))",
+        r"(?<=%)(?=-?\d)",
+        r"(?<=\d)(?=20\d{2}年)",
+    ]
+    while True:
+        updated = text
+        for pattern in patterns:
+            updated = re.sub(pattern, " ", updated)
+        if updated == text:
+            return updated
+        text = updated
+
+
 def _clean_extracted_text(text: str) -> str:
     text = text.replace("\x00", " ")
     for bad_char in ("\u00ee", "\u00ef", "\u00ec", "\u00f0", "\u00f1", "\u00f2", "\ufffd"):
         text = text.replace(bad_char, " ")
     text = "".join(char if char.isprintable() or char in "\n\t" else " " for char in text)
     text = _collapse_spaced_text(text)
+    text = _stabilize_numeric_boundaries(text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s+", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -419,6 +440,7 @@ def infer_pdf_metadata(path: Path, text: str = "") -> dict[str, Any]:
             metadata["report_period"] = f"{year}HY"
         elif "\u5e74\u5ea6\u62a5\u544a" in title_probe:
             metadata["report_period"] = f"{year}FY"
+    metadata["report_period"] = normalize_report_period(metadata.get("report_period", ""))
     return metadata
 
 
