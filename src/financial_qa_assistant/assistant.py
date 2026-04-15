@@ -15,6 +15,8 @@ from .utils import (
     ATTRIBUTION_KEYWORDS,
     CAUSE_KEYWORDS,
     CHART_KEYWORDS,
+    COMPANY_SET_FOLLOW_UP_HINTS,
+    CORE_FINANCIAL_TABLES,
     FOLLOW_UP_HINTS,
     INDUSTRY_QUERY_KEYWORDS,
     LATEST_KEYWORDS,
@@ -23,6 +25,7 @@ from .utils import (
     TREND_KEYWORDS,
     artifact_name,
     compact_text,
+    canonicalize_query_text,
     detect_company_field,
     detect_metric,
     detect_top_k,
@@ -114,6 +117,7 @@ class PlannedQuestionState:
     period_info: dict[str, str] | None
     company_field: tuple[str, str] | None
     context_before: dict[str, Any]
+    context_slots: dict[str, Any] = field(default_factory=dict)
     debug_trace: dict[str, Any] = field(default_factory=dict)
 
 
@@ -122,12 +126,89 @@ class FinancialQAEngine:
         self.config = config
         self.database = database or Database(config.db_path)
         self.last_debug_trace: dict[str, Any] = {}
-        self.company_rows = self.database.query("SELECT * FROM company_info ORDER BY stock_code")
+        self.company_rows = self._load_company_rows()
         self.company_aliases = self._build_company_aliases()
         self.company_code_map = self._build_company_code_map()
         self.company_fragment_aliases = self._build_company_fragment_aliases()
         self._ensure_runtime_indexes()
         self.question_bank_rows = self._load_question_bank_rows()
+
+    def _load_company_rows(self) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+
+        def _merge_row(stock_code: Any, stock_abbr: Any = "", company_name: Any = "", *, source: str = "", extra: dict[str, Any] | None = None) -> None:
+            normalized_code = normalize_stock_code(stock_code)
+            abbr = str(stock_abbr or "").strip()
+            name = str(company_name or "").strip()
+            key = normalized_code or abbr or name
+            if not key:
+                return
+            payload = merged.setdefault(
+                key,
+                {
+                    "serial_number": None,
+                    "stock_code": normalized_code,
+                    "stock_abbr": abbr,
+                    "company_name": name or abbr,
+                    "english_name": "",
+                    "industry": "",
+                    "listed_exchange": "",
+                    "security_type": "",
+                    "registered_region": "",
+                    "registered_capital": "",
+                    "employee_count": "",
+                    "management_count": "",
+                    "__source__": source,
+                },
+            )
+            if normalized_code and not payload.get("stock_code"):
+                payload["stock_code"] = normalized_code
+            if abbr and not payload.get("stock_abbr"):
+                payload["stock_abbr"] = abbr
+            if name and not payload.get("company_name"):
+                payload["company_name"] = name
+            if extra:
+                for field, value in extra.items():
+                    if value not in (None, "") and not payload.get(field):
+                        payload[field] = value
+            if source == "company_info":
+                payload["__source__"] = source
+
+        if self.database.table_exists("company_info"):
+            for row in self.database.query("SELECT * FROM company_info ORDER BY stock_code"):
+                _merge_row(
+                    row["stock_code"],
+                    row["stock_abbr"],
+                    row["company_name"],
+                    source="company_info",
+                    extra=dict(row),
+                )
+
+        if self.database.table_exists("financial_company_aliases"):
+            for row in self.database.query("SELECT stock_code, stock_abbr, company_name, source FROM financial_company_aliases ORDER BY stock_code"):
+                _merge_row(
+                    row["stock_code"],
+                    row["stock_abbr"],
+                    row["company_name"],
+                    source=str(row["source"] or "financial_company_aliases"),
+                )
+
+        fallback_tables = ("financial_metric_facts",) + CORE_FINANCIAL_TABLES
+        for table in fallback_tables:
+            if not self.database.table_exists(table):
+                continue
+            columns = self.database.table_columns(table)
+            if "stock_code" not in columns:
+                continue
+            stock_abbr_expr = "stock_abbr" if "stock_abbr" in columns else "''"
+            for row in self.database.query(
+                f"SELECT DISTINCT stock_code, {stock_abbr_expr} AS stock_abbr FROM {table} WHERE stock_code <> '' OR {stock_abbr_expr} <> ''"
+            ):
+                _merge_row(row["stock_code"], row["stock_abbr"], row["stock_abbr"], source=table)
+
+        rows = list(merged.values())
+        rows.sort(key=lambda item: (str(item.get("stock_code") or ""), str(item.get("stock_abbr") or "")))
+        return rows
 
     def _build_company_aliases(self) -> dict[str, dict[str, Any]]:
         aliases: dict[str, dict[str, Any]] = {}
@@ -199,7 +280,7 @@ class FinancialQAEngine:
                 continue
 
     def refresh(self) -> None:
-        self.company_rows = self.database.query("SELECT * FROM company_info ORDER BY stock_code")
+        self.company_rows = self._load_company_rows()
         self.company_aliases = self._build_company_aliases()
         self.company_code_map = self._build_company_code_map()
         self.company_fragment_aliases = self._build_company_fragment_aliases()
@@ -294,21 +375,24 @@ class FinancialQAEngine:
             return False
 
         standalone_period = parse_period(question, {})
-        if any(hint in compact for hint in FOLLOW_UP_HINTS):
+        follow_up_hint = any(hint in compact for hint in FOLLOW_UP_HINTS)
+        company_set_hint = any(hint in compact for hint in COMPANY_SET_FOLLOW_UP_HINTS)
+        short_follow_up = len(compact) <= 8 and compact.endswith(("\u5462", "\u5417", "\uff1f", "?"))
+        if follow_up_hint or company_set_hint:
             return True
         if company_field and not detected_company:
-            return True
+            return bool(context.get("company"))
         if wants_attribution and not detected_company:
+            if not (follow_up_hint or company_set_hint or compact.startswith(("\u90a3", "\u5b83", "\u8fd9", "\u5176"))):
+                return False
             return True
-        if detected_metric and not detected_company and context.get("company"):
+        if detected_metric and not detected_company and context.get("company") and (follow_up_hint or short_follow_up or standalone_period):
             return True
-        if standalone_period and (context.get("metric") or detected_metric):
+        if standalone_period and (context.get("metric") or detected_metric) and (follow_up_hint or short_follow_up or detected_metric is None):
             return True
-        if detected_company and not detected_metric and context.get("metric") and (standalone_period or wants_attribution or len(compact) <= 16):
+        if detected_company and not detected_metric and context.get("metric") and (standalone_period or wants_attribution or follow_up_hint or short_follow_up):
             return True
-        if not detected_company and not detected_metric and not top_k and not wants_trend and not latest_requested and len(compact) <= 12:
-            return True
-        if compact.endswith("\u7684") and len(compact) <= 20:
+        if not detected_company and not detected_metric and not top_k and not wants_trend and not latest_requested and (follow_up_hint or short_follow_up):
             return True
         return False
 
@@ -429,6 +513,31 @@ class FinancialQAEngine:
         normalized = normalize_text(question)
         return normalized, compact_text(normalized)
 
+    def _context_slots(self, context: dict[str, Any]) -> dict[str, Any]:
+        company_set = context.get("last_company_set") or []
+        ranking_result = context.get("last_ranking_result") or []
+        metric = context.get("last_metric") or context.get("metric")
+        period_info = context.get("last_period") or context.get("period_info")
+        return {
+            "last_company_set": list(company_set)[:10] if isinstance(company_set, list) else [],
+            "last_ranking_result": list(ranking_result)[:10] if isinstance(ranking_result, list) else [],
+            "last_metric": metric[2] if isinstance(metric, tuple) and len(metric) >= 3 else "",
+            "last_period": (period_info or {}).get("report_period", "") if isinstance(period_info, dict) else "",
+            "last_query_mode": str(context.get("last_query_mode") or ""),
+        }
+
+    def _single_company_from_slots(self, context: dict[str, Any], question: str) -> dict[str, Any] | None:
+        company_set = context.get("last_company_set") or []
+        if not isinstance(company_set, list) or len(company_set) != 1:
+            return None
+        compact = compact_text(question)
+        if not any(hint in compact for hint in FOLLOW_UP_HINTS + COMPANY_SET_FOLLOW_UP_HINTS):
+            return None
+        stock_code = normalize_stock_code(company_set[0].get("stock_code"))
+        if stock_code and stock_code in self.company_code_map:
+            return self.company_code_map[stock_code]
+        return company_set[0]
+
     def _detect_metric_step(self, question: str) -> tuple[str, str, str] | None:
         return detect_metric(question)
 
@@ -491,6 +600,7 @@ class FinancialQAEngine:
 
     def _build_question_state(self, question: str, context: dict[str, Any]) -> PlannedQuestionState:
         normalized_question, compact = self._normalize_question(question)
+        canonical_question = canonicalize_query_text(normalized_question)
         detected_company = self._detect_company(normalized_question)
         company_field = detect_company_field(normalized_question)
         detected_metric = self._detect_metric_step(normalized_question)
@@ -505,6 +615,10 @@ class FinancialQAEngine:
             "metric": context.get("metric"),
             "period_info": context.get("period_info"),
             "year": context.get("year"),
+            "last_company_set": context.get("last_company_set"),
+            "last_metric": context.get("last_metric"),
+            "last_period": context.get("last_period"),
+            "last_query_mode": context.get("last_query_mode"),
         }
         follow_up = self._resolve_context(
             question=normalized_question,
@@ -519,9 +633,11 @@ class FinancialQAEngine:
             wants_research=wants_research,
             latest_requested=latest_requested,
         )
-        company = detected_company or context.get("company")
-        metric = detected_metric or context.get("metric")
+        company = detected_company or self._single_company_from_slots(context, normalized_question) or context.get("company")
+        metric = detected_metric or context.get("metric") or context.get("last_metric")
         period_info = self._detect_period_step(normalized_question, context, follow_up)
+        if not period_info and follow_up and isinstance(context.get("last_period"), dict):
+            period_info = context.get("last_period")
         if company:
             context["company"] = company
         if metric:
@@ -529,9 +645,11 @@ class FinancialQAEngine:
         if period_info:
             context["period_info"] = period_info
             context["year"] = period_info["year"]
-        plan = plan_subtasks(normalized_question)
+        plan = plan_subtasks(canonical_question)
+        context_slots = self._context_slots(context)
         debug_trace = {
             "normalize_question": normalized_question,
+            "canonical_question": plan.canonical_question,
             "resolve_context": {
                 "follow_up": follow_up,
                 "context_before": context_before,
@@ -545,7 +663,9 @@ class FinancialQAEngine:
             "detect_metric": metric[2] if metric else "",
             "detect_period": (period_info or {}).get("report_period", ""),
             "detect_query_mode": "",
-            "plan_subtasks": [subtask.intent for subtask in plan.subtasks],
+            "chosen_subtasks": [subtask.intent for subtask in plan.subtasks],
+            "context_slots": context_slots,
+            "fallback_reason": plan.fallback_reason,
         }
         state = PlannedQuestionState(
             question=normalized_question,
@@ -557,6 +677,7 @@ class FinancialQAEngine:
             period_info=period_info,
             company_field=company_field,
             context_before=context_before,
+            context_slots=context_slots,
             debug_trace=debug_trace,
         )
         state.debug_trace["detect_query_mode"] = self._detect_query_mode(state)
@@ -566,7 +687,8 @@ class FinancialQAEngine:
 
     def _need_clarification(self, state: PlannedQuestionState) -> AnswerPayload | None:
         query_mode = self._detect_query_mode(state)
-        cross_company_query = self._is_cross_company_query(state.compact_question, state.plan.top_k)
+        company_set = state.context_slots.get("last_company_set") if isinstance(state.context_slots, dict) else []
+        cross_company_query = self._is_cross_company_query(state.compact_question, state.plan.top_k) or (isinstance(company_set, list) and len(company_set) > 1)
         if not state.company and state.metric and not cross_company_query and not state.plan.industry_query and not state.plan.wants_research:
             if query_mode == "attribution":
                 return self._answer_missing_company_clarification(state.metric[2], "归因分析")
@@ -599,6 +721,7 @@ class FinancialQAEngine:
         company = state.company
         metric = state.metric
         period_info = state.period_info
+        prior_company_rows = self._context_company_rows(context)
 
         if state.company_field and company:
             return self._answer_company_profile(company, state.company_field)
@@ -611,6 +734,39 @@ class FinancialQAEngine:
         medical_insurance_answer = self._answer_medical_insurance_products(state.question)
         if medical_insurance_answer:
             return medical_insurance_answer
+
+        if metric and {"ranking", "yoy", "maxmin"}.issubset(set(state.plan.intents)) and state.plan.top_k:
+            generic_multi = self._answer_metric_ranking_with_growth_extreme(metric[0], metric[1], metric[2], period_info, state.plan.top_k, context)
+            if generic_multi:
+                return generic_multi
+
+        if metric and len(prior_company_rows) > 1 and {"yoy", "maxmin"}.issubset(set(state.plan.intents)):
+            company_set_answer = self._answer_company_set_extreme(
+                metric[0],
+                metric[1],
+                metric[2],
+                period_info,
+                prior_company_rows,
+                prefer_growth=True,
+                kind="min" if "最低" in state.compact_question or "最小" in state.compact_question else "max",
+                context=context,
+            )
+            if company_set_answer:
+                return company_set_answer
+
+        if metric and len(prior_company_rows) > 1 and "maxmin" in state.plan.intents:
+            company_set_answer = self._answer_company_set_extreme(
+                metric[0],
+                metric[1],
+                metric[2],
+                period_info,
+                prior_company_rows,
+                prefer_growth=False,
+                kind="min" if "最低" in state.compact_question or "最小" in state.compact_question else "max",
+                context=context,
+            )
+            if company_set_answer:
+                return company_set_answer
 
         if state.plan.top_k and "同比" in state.compact_question and "利润" in state.compact_question:
             return self._answer_profit_ranking_with_growth_v2(period_info, state.plan.top_k, context)
@@ -638,6 +794,18 @@ class FinancialQAEngine:
         return self._answer_retrieval_v2(state.question, company, prefer_causes=False)
 
     def _execute_subtasks(self, state: PlannedQuestionState, context: dict[str, Any]) -> list[AnswerPayload]:
+        if state.metric and {"ranking", "yoy", "maxmin"}.issubset(set(state.plan.intents)) and state.plan.top_k:
+            generic_multi = self._answer_metric_ranking_with_growth_extreme(
+                state.metric[0],
+                state.metric[1],
+                state.metric[2],
+                state.period_info,
+                state.plan.top_k,
+                context,
+            )
+            if generic_multi:
+                return [generic_multi]
+
         if {"ranking", "yoy", "maxmin"}.issubset(set(state.plan.intents)) and state.plan.top_k and "利润" in state.compact_question:
             return [self._answer_profit_ranking_with_growth_v2(state.period_info, state.plan.top_k, context)]
 
@@ -686,15 +854,31 @@ class FinancialQAEngine:
         if context is None:
             context = {}
         state = self._build_question_state(question, context)
+        query_mode = self._detect_query_mode(state)
         clarification = self._need_clarification(state)
         if clarification:
             state.debug_trace["need_clarification"] = clarification.content
+            self._remember_result_context(
+                context,
+                metric=state.metric,
+                period_info=state.period_info,
+                query_mode=query_mode,
+                company=state.company,
+            )
             return clarification
         state.debug_trace["need_clarification"] = ""
         state.debug_trace["plan_subtasks"] = self._plan_subtasks(state)
         payloads = self._execute_subtasks(state, context)
         answer = self._assemble_answer(state, payloads)
         state.debug_trace["assemble_answer"] = {"content_length": len(answer.content), "reference_count": len(answer.references)}
+        self._remember_result_context(
+            context,
+            metric=state.metric,
+            period_info=state.period_info,
+            query_mode=query_mode,
+            company=state.company,
+        )
+        state.debug_trace["context_slots"] = self._context_slots(context)
         self.last_debug_trace = state.debug_trace
         context["_debug_trace"] = state.debug_trace
         return answer
@@ -717,6 +901,199 @@ class FinancialQAEngine:
         if company:
             return str(company.get("stock_abbr") or company.get("company_name") or fallback)
         return str(fallback or code or "")
+
+    def _company_stub(self, company: dict[str, Any]) -> dict[str, str]:
+        return {
+            "stock_code": normalize_stock_code(company.get("stock_code")),
+            "stock_abbr": str(company.get("stock_abbr") or company.get("company_name") or "").strip(),
+            "company_name": str(company.get("company_name") or company.get("stock_abbr") or "").strip(),
+        }
+
+    def _remember_result_context(
+        self,
+        context: dict[str, Any],
+        *,
+        metric: tuple[str, str, str] | None = None,
+        period_info: dict[str, str] | None = None,
+        query_mode: str = "",
+        company: dict[str, Any] | None = None,
+        company_set: list[dict[str, Any]] | None = None,
+        ranking_result: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if metric:
+            context["last_metric"] = metric
+        if period_info:
+            context["last_period"] = period_info
+        if query_mode:
+            context["last_query_mode"] = query_mode
+        if company:
+            context["company"] = company
+            context["last_company_set"] = [self._company_stub(company)]
+        elif company_set is not None:
+            context["last_company_set"] = [self._company_stub(item) for item in company_set[:20]]
+        if ranking_result is not None:
+            context["last_ranking_result"] = ranking_result[:20]
+
+    def _context_company_rows(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        company_rows: list[dict[str, Any]] = []
+        for item in context.get("last_company_set") or []:
+            stock_code = normalize_stock_code(item.get("stock_code"))
+            if stock_code and stock_code in self.company_code_map:
+                company_rows.append(self.company_code_map[stock_code])
+                continue
+            if stock_code:
+                company_rows.append(
+                    {
+                        "stock_code": stock_code,
+                        "stock_abbr": str(item.get("stock_abbr") or item.get("company_name") or stock_code),
+                        "company_name": str(item.get("company_name") or item.get("stock_abbr") or stock_code),
+                    }
+                )
+        return company_rows
+
+    def _answer_company_set_extreme(
+        self,
+        table_name: str,
+        column_name: str,
+        metric_label: str,
+        period_info: dict[str, str] | None,
+        company_rows: list[dict[str, Any]],
+        *,
+        prefer_growth: bool,
+        kind: str = "max",
+        context: dict[str, Any],
+    ) -> AnswerPayload | None:
+        stock_codes = [normalize_stock_code(item.get("stock_code")) for item in company_rows if normalize_stock_code(item.get("stock_code"))]
+        if not stock_codes:
+            return None
+        period = period_info["report_period"] if period_info else self._latest_fy_period()
+        expr = self._metric_sql_expr(column_name)
+        placeholders = ", ".join("?" for _ in stock_codes)
+        sql = (
+            f"SELECT stock_code, stock_abbr, {expr} AS metric_value FROM {table_name} "
+            f"WHERE report_period = {self._quote(period)} AND stock_code IN ({', '.join(self._quote(code) for code in stock_codes)})"
+        )
+        rows = self.database.query(
+            f"""
+            SELECT stock_code, stock_abbr, {expr} AS metric_value
+            FROM {table_name}
+            WHERE report_period = ? AND stock_code IN ({placeholders})
+            """,
+            (period, *stock_codes),
+        )
+        scored_rows: list[tuple[dict[str, Any], float, str]] = []
+        ranking_payload: list[dict[str, Any]] = []
+        for row in rows:
+            stock_code = str(row["stock_code"] or "")
+            display_name = self._company_label(stock_code, str(row["stock_abbr"] or ""))
+            if prefer_growth:
+                yoy_text, yoy_value = self._fy_yoy_display(table_name, stock_code, period, expr, None)
+                if yoy_value is None:
+                    continue
+                scored_rows.append(({"stock_code": stock_code, "stock_abbr": display_name}, yoy_value, yoy_text))
+                ranking_payload.append({"stock_code": stock_code, "stock_abbr": display_name, "yoy": yoy_value})
+            else:
+                metric_value = to_float(row["metric_value"])
+                if metric_value is None:
+                    continue
+                scored_rows.append(({"stock_code": stock_code, "stock_abbr": display_name}, metric_value, self._format_metric_value(metric_label, metric_value)))
+                ranking_payload.append({"stock_code": stock_code, "stock_abbr": display_name, "metric_value": metric_value})
+        if not scored_rows:
+            return None
+        reverse = kind != "min"
+        best_company, best_value, best_text = sorted(scored_rows, key=lambda item: item[1], reverse=reverse)[0]
+        self._remember_result_context(
+            context,
+            period_info=period_info,
+            query_mode="ranking",
+            company_set=company_rows,
+            ranking_result=ranking_payload,
+        )
+        if prefer_growth:
+            direction = "最高" if kind != "min" else "最低"
+            content = f"在上一轮命中的 {len(company_rows)} 家公司里，{period}{metric_label}同比增幅{direction}的是{best_company['stock_abbr']}，为 {best_value:.2f}%。"
+        else:
+            edge = "最高" if kind != "min" else "最低"
+            content = f"在上一轮命中的 {len(company_rows)} 家公司里，{period}{metric_label}{edge}的是{best_company['stock_abbr']}，为 {best_text}。"
+        return AnswerPayload(content=content, sql=sql)
+
+    def _answer_metric_ranking_with_growth_extreme(
+        self,
+        table_name: str,
+        column_name: str,
+        metric_label: str,
+        period_info: dict[str, str] | None,
+        top_k: int,
+        context: dict[str, Any],
+    ) -> AnswerPayload | None:
+        period = period_info["report_period"] if period_info else self._latest_fy_period()
+        expr = self._metric_sql_expr(column_name)
+        sql = (
+            f"SELECT stock_code, stock_abbr, {expr} AS metric_value FROM {table_name} "
+            f"WHERE report_period = {self._quote(period)} ORDER BY metric_value DESC LIMIT {top_k}"
+        )
+        rows = self.database.query(
+            f"""
+            SELECT stock_code, stock_abbr, {expr} AS metric_value
+            FROM {table_name}
+            WHERE report_period = ?
+            ORDER BY metric_value DESC
+            LIMIT ?
+            """,
+            (period, top_k),
+        )
+        valid_rows: list[dict[str, Any]] = []
+        chart_labels: list[str] = []
+        chart_values: list[float] = []
+        ranking_lines: list[str] = []
+        yoy_candidates: list[tuple[dict[str, Any], float]] = []
+        ranking_payload: list[dict[str, Any]] = []
+        for index, row in enumerate(rows, start=1):
+            stock_code = str(row["stock_code"] or "")
+            value = to_float(row["metric_value"])
+            if value is None:
+                continue
+            display_name = self._company_label(stock_code, str(row["stock_abbr"] or ""))
+            yoy_text, yoy_value = self._fy_yoy_display(table_name, stock_code, period, expr, None)
+            ranking_lines.append(f"{index}. {display_name}：{self._format_metric_value(metric_label, value)}，同比{yoy_text}")
+            valid_rows.append({"stock_code": stock_code, "stock_abbr": display_name, "company_name": display_name})
+            chart_labels.append(display_name)
+            chart_values.append(value)
+            ranking_item = {"stock_code": stock_code, "stock_abbr": display_name, "metric_value": value}
+            if yoy_value is not None:
+                ranking_item["yoy"] = yoy_value
+                yoy_candidates.append((valid_rows[-1], yoy_value))
+            ranking_payload.append(ranking_item)
+        if not valid_rows:
+            return None
+        relative_path = self._save_chart(
+            "bar",
+            context,
+            f"{metric_label} Top{top_k}",
+            chart_labels,
+            chart_values,
+            metric_label + period + "_ranking_growth",
+        )
+        images = [relative_path] if relative_path else []
+        chart_types = [self._chart_type_label("bar")] if relative_path else []
+        if yoy_candidates:
+            best_company, best_yoy = max(yoy_candidates, key=lambda item: item[1])
+            conclusion = f"{period} Top{min(top_k, len(valid_rows))} 企业中，{metric_label}同比增幅最高的是{best_company['stock_abbr']}，为 {best_yoy:.2f}%。"
+        else:
+            conclusion = f"{period} Top{min(top_k, len(valid_rows))} 企业已列出，但当前可用同比数据不足。"
+        self._remember_result_context(
+            context,
+            period_info=period_info,
+            query_mode="ranking",
+            company_set=valid_rows,
+            ranking_result=ranking_payload,
+        )
+        return AnswerPayload(
+            content=conclusion + "\n" + "\n".join(ranking_lines),
+            sql=sql,
+            image=images,
+            chart_types=chart_types,
+        )
 
     def _is_cross_company_query(self, compact: str, top_k: int | None) -> bool:
         if top_k:
@@ -1119,7 +1496,7 @@ class FinancialQAEngine:
         if company and latest_requested:
             return self._answer_latest_scalar(table_name, column_name, metric_label, company)
         if not company:
-            return self._answer_threshold_filter_v2(table_name, column_name, metric_label, period_info, question)
+            return self._answer_threshold_filter_v2(table_name, column_name, metric_label, period_info, question, context)
         return None
 
     def _answer_scalar(
@@ -1654,6 +2031,7 @@ class FinancialQAEngine:
         metric_label: str,
         period_info: dict[str, str] | None,
         question: str,
+        context: dict[str, Any],
     ) -> AnswerPayload | None:
         threshold = self._parse_threshold_condition(question, column_name, metric_label)
         if threshold is None:
@@ -1756,6 +2134,18 @@ class FinancialQAEngine:
         )
         images = [relative_path] if relative_path else []
         chart_types = [self._chart_type_label("bar")] if relative_path else []
+        ranking_rows = [
+            {"stock_code": code, "stock_abbr": name, "company_name": name, "metric_value": value}
+            for code, name, value in valid_rows
+        ]
+        self._remember_result_context(
+            context,
+            metric=(table_name, column_name, metric_label),
+            period_info=period_info,
+            query_mode="ranking",
+            company_set=ranking_rows,
+            ranking_result=ranking_rows,
+        )
         return AnswerPayload(
             content=f"{period}的{metric_label}排名结果如下：{summary}。",
             sql=sql,
@@ -1863,6 +2253,22 @@ class FinancialQAEngine:
 
         images = [relative_path] if relative_path else []
         chart_types = [self._chart_type_label("bar")] if relative_path else []
+        ranking_rows = [
+            {
+                "stock_code": str(row["stock_code"] or ""),
+                "stock_abbr": self._company_label(row["stock_code"], str(row["stock_abbr"] or "")),
+                "company_name": self._company_label(row["stock_code"], str(row["stock_abbr"] or "")),
+            }
+            for row in valid_rows
+        ]
+        self._remember_result_context(
+            context,
+            metric=("income_sheet", metric_column, metric_name),
+            period_info={"year": year, "report_period": period, "label": f"{year}年年度"},
+            query_mode="ranking",
+            company_set=ranking_rows,
+            ranking_result=ranking_rows,
+        )
         return AnswerPayload(
             content=prefix + "\n" + "\n".join(ranking_lines) + "\n" + suffix,
             sql=sql,

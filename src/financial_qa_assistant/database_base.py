@@ -3,6 +3,7 @@
 import csv
 import re
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -242,6 +243,40 @@ def create_base_tables(database: Database) -> None:
     )
     database.execute(
         """
+        CREATE TABLE IF NOT EXISTS structured_field_lineage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name TEXT,
+            stock_code TEXT,
+            report_period TEXT,
+            field_name TEXT,
+            field_value REAL,
+            source_file TEXT,
+            source_excerpt TEXT,
+            source_priority INTEGER,
+            extractor_stage TEXT,
+            updated_at TEXT,
+            decision TEXT,
+            candidate_value REAL,
+            candidate_source_file TEXT,
+            candidate_source_excerpt TEXT,
+            candidate_priority INTEGER,
+            candidate_extractor_stage TEXT
+        )
+        """
+    )
+    database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS financial_company_aliases (
+            stock_code TEXT,
+            stock_abbr TEXT,
+            company_name TEXT,
+            source_table TEXT,
+            source TEXT
+        )
+        """
+    )
+    database.execute(
+        """
         CREATE TABLE IF NOT EXISTS medical_insurance_product_facts (
             year TEXT,
             product_name TEXT,
@@ -252,6 +287,18 @@ def create_base_tables(database: Database) -> None:
             evidence_text TEXT,
             company_name TEXT
         )
+        """
+    )
+    database.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_structured_field_lineage_lookup
+        ON structured_field_lineage(table_name, stock_code, report_period, field_name, decision)
+        """
+    )
+    database.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_financial_company_aliases_code
+        ON financial_company_aliases(stock_code)
         """
     )
 
@@ -480,6 +527,8 @@ def load_manual_csvs(database: Database, config: AppConfig) -> None:
 def write_financial_table(database: Database, table: str, rows: dict[tuple[str, str], dict[str, Any]]) -> None:
     database.execute(f"DELETE FROM {table}")
     if not rows:
+        if database.table_exists("structured_field_lineage"):
+            database.execute("DELETE FROM structured_field_lineage WHERE table_name = ?", (table,))
         return
     ordered_columns = database.table_column_order(table)
     ordered_rows = sorted(
@@ -493,6 +542,82 @@ def write_financial_table(database: Database, table: str, rows: dict[tuple[str, 
         values.append([row.get(column) for column in ordered_columns])
     sql = f"INSERT INTO {table} ({', '.join(ordered_columns)}) VALUES ({', '.join('?' for _ in ordered_columns)})"
     database.executemany(sql, values)
+    _write_structured_field_lineage(database, table, ordered_rows, ordered_columns)
+
+
+def _write_structured_field_lineage(
+    database: Database,
+    table: str,
+    ordered_rows: list[dict[str, Any]],
+    ordered_columns: list[str],
+) -> None:
+    if not database.table_exists("structured_field_lineage"):
+        return
+    database.execute("DELETE FROM structured_field_lineage WHERE table_name = ?", (table,))
+    lineage_rows: list[tuple[Any, ...]] = []
+    for row in ordered_rows:
+        stock_code = str(row.get("stock_code") or "")
+        report_period = str(row.get("report_period") or "")
+        chosen_lineage = row.get("__field_lineage__", {})
+        for field_name, meta in chosen_lineage.items():
+            if field_name not in ordered_columns:
+                continue
+            field_value = row.get(field_name)
+            if field_value in (None, ""):
+                continue
+            lineage_rows.append(
+                (
+                    table,
+                    stock_code,
+                    report_period,
+                    field_name,
+                    field_value,
+                    meta.get("source_file", ""),
+                    meta.get("source_excerpt", ""),
+                    int(meta.get("source_priority", 0) or 0),
+                    meta.get("extractor_stage", ""),
+                    meta.get("updated_at", datetime.now().isoformat(timespec="seconds")),
+                    "chosen",
+                    None,
+                    "",
+                    "",
+                    None,
+                    "",
+                )
+            )
+        for conflict in row.get("__lineage_conflicts__", []):
+            lineage_rows.append(
+                (
+                    table,
+                    stock_code,
+                    report_period,
+                    conflict.get("field_name", ""),
+                    conflict.get("chosen_value"),
+                    conflict.get("chosen_source_file", ""),
+                    conflict.get("chosen_source_excerpt", ""),
+                    int(conflict.get("chosen_priority", 0) or 0),
+                    conflict.get("chosen_extractor_stage", ""),
+                    conflict.get("updated_at", datetime.now().isoformat(timespec="seconds")),
+                    conflict.get("decision", "conflict"),
+                    conflict.get("candidate_value"),
+                    conflict.get("candidate_source_file", ""),
+                    conflict.get("candidate_source_excerpt", ""),
+                    conflict.get("candidate_priority"),
+                    conflict.get("candidate_extractor_stage", ""),
+                )
+            )
+    if lineage_rows:
+        database.executemany(
+            """
+            INSERT INTO structured_field_lineage (
+                table_name, stock_code, report_period, field_name, field_value,
+                source_file, source_excerpt, source_priority, extractor_stage,
+                updated_at, decision, candidate_value, candidate_source_file,
+                candidate_source_excerpt, candidate_priority, candidate_extractor_stage
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            lineage_rows,
+        )
 
 
 def refresh_metric_facts(database: Database) -> None:
@@ -501,6 +626,26 @@ def refresh_metric_facts(database: Database) -> None:
     for table, mappings in FACT_COLUMN_MAP.items():
         if not database.table_exists(table):
             continue
+        lineage_map: dict[tuple[str, str, str], dict[str, Any]] = {}
+        if database.table_exists("structured_field_lineage"):
+            for item in database.query(
+                """
+                SELECT stock_code, report_period, field_name, source_file, source_excerpt
+                FROM structured_field_lineage
+                WHERE table_name = ? AND decision = 'chosen'
+                """,
+                (table,),
+            ):
+                lineage_map[
+                    (
+                        str(item["stock_code"] or ""),
+                        str(item["report_period"] or ""),
+                        str(item["field_name"] or ""),
+                    )
+                ] = {
+                    "source_file": str(item["source_file"] or ""),
+                    "source_excerpt": str(item["source_excerpt"] or ""),
+                }
         column_set = database.table_columns(table)
         query_columns = ["stock_code", "stock_abbr", "report_period", "report_date"]
         if "source_file" in column_set:
@@ -521,6 +666,14 @@ def refresh_metric_facts(database: Database) -> None:
                 if value in (None, ""):
                     continue
                 label = get_standard_metric_label(table, column)
+                lineage = lineage_map.get(
+                    (
+                        str(row["stock_code"] or ""),
+                        str(row["report_period"] or ""),
+                        column,
+                    ),
+                    {},
+                )
                 rows.append(
                     (
                         row["stock_code"],
@@ -532,8 +685,8 @@ def refresh_metric_facts(database: Database) -> None:
                         value,
                         row[yoy_column] if yoy_column and yoy_column in row.keys() else None,
                         "structured",
-                        row["source_file"] if "source_file" in row.keys() else "",
-                        row["source_excerpt"] if "source_excerpt" in row.keys() else "",
+                        lineage.get("source_file") or (row["source_file"] if "source_file" in row.keys() else ""),
+                        lineage.get("source_excerpt") or (row["source_excerpt"] if "source_excerpt" in row.keys() else ""),
                     )
                 )
     if rows:

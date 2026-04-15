@@ -1,0 +1,63 @@
+[
+  {
+    "id": "scalar_value",
+    "context_group": "scalar_chain",
+    "question": "华润三九2024年的净利润是多少",
+    "expect_sql": true,
+    "expect_clarification": false
+  },
+  {
+    "id": "follow_up_period",
+    "context_group": "scalar_chain",
+    "question": "那2023年的呢",
+    "expect_sql": true,
+    "expect_clarification": false
+  },
+  {
+    "id": "topk_list",
+    "context_group": "ranking_chain",
+    "question": "2024年净利润前2的企业有哪些",
+    "expect_sql": true,
+    "expect_image": true
+  },
+  {
+    "id": "follow_up_max_growth",
+    "context_group": "ranking_chain",
+    "question": "其中谁增幅最大",
+    "expect_sql": true,
+    "expect_clarification": false
+  },
+  {
+    "id": "ranking_yoy_max_combo",
+    "context_group": "fresh",
+    "question": "2024年前2家净利润最高的企业里谁增幅最大",
+    "expect_sql": true,
+    "expect_image": true
+  },
+  {
+    "id": "trend_plus_attribution",
+    "context_group": "fresh",
+    "question": "华润三九近三年的主营业务收入趋势并分析原因",
+    "expect_sql": true,
+    "expect_image": true,
+    "expect_references": true
+  },
+  {
+    "id": "task3_attribution",
+    "context_group": "fresh",
+    "question": "华润三九主营业务收入上升的原因是什么",
+    "expect_references": true
+  },
+  {
+    "id": "missing_company",
+    "context_group": "fresh",
+    "question": "主营业务收入上升的原因是什么",
+    "expect_clarification": true
+  },
+  {
+    "id": "missing_period",
+    "context_group": "fresh",
+    "question": "华润三九的净利润是多少",
+    "expect_clarification": true
+  }
+]

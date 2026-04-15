@@ -577,6 +577,17 @@ class BasicTests(unittest.TestCase):
 
         db_path.unlink(missing_ok=True)
 
+    def test_base_tables_include_lineage_and_alias_support(self) -> None:
+        db_path = WORKSPACE / "build" / "test_lineage_support.sqlite3"
+        db_path.unlink(missing_ok=True)
+        database = Database(db_path)
+        create_base_tables(database)
+
+        self.assertTrue(database.table_exists("structured_field_lineage"))
+        self.assertTrue(database.table_exists("financial_company_aliases"))
+
+        db_path.unlink(missing_ok=True)
+
     def test_pdf_cleaning_splits_glued_numbers(self) -> None:
         cleaned = _clean_extracted_text("营业收入585,461,786.232024年主要会计数据")
         self.assertIn("585,461,786.23 2024年", cleaned)
@@ -827,6 +838,19 @@ class AssistantPlanningTests(unittest.TestCase):
         self.assertIn("证据依据", answer.content)
         self.assertLessEqual(len(answer.references), 3)
         self.assertTrue(all(reference["text"] for reference in answer.references))
+
+    def test_missing_company_attribution_does_not_reuse_stale_context_without_follow_up_hint(self) -> None:
+        engine, database, _db_path = self._build_engine("test_planning_missing_company_guard.sqlite3")
+        self._seed_company(database, "000999", "华润三九", "华润三九医药股份有限公司")
+        self._seed_income(database, "000999", "华润三九", "2024FY", "2025-03-20", 100.0, 120.0, 560.0, 12.0)
+        engine.refresh()
+        context: dict[str, object] = {}
+
+        engine.answer_question("华润三九主营业务收入上升的原因是什么?", context)
+        answer = engine.answer_question("主营业务收入上升的原因是什么?", context)
+
+        self.assertIn("补充公司", answer.content)
+
 
 if __name__ == "__main__":
     unittest.main()

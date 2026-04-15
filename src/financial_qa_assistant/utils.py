@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 PERIOD_PATTERN = re.compile(r"20\d{2}(?:FY|Q1|Q2|Q3|HY)$")
@@ -221,6 +221,9 @@ STANDARD_METRIC_CATALOG: list[dict[str, Any]] = [
 STANDARD_METRIC_LABELS: dict[tuple[str, str], str] = {
     (item["table"], item["column"]): item["label"] for item in STANDARD_METRIC_CATALOG
 }
+STANDARD_METRIC_LABELS_BY_COLUMN: dict[str, str] = {}
+for _metric in STANDARD_METRIC_CATALOG:
+    STANDARD_METRIC_LABELS_BY_COLUMN.setdefault(_metric["column"], _metric["label"])
 
 FACT_METRIC_SPECS: dict[str, list[tuple[str, str, str | None]]] = {}
 for _metric in STANDARD_METRIC_CATALOG:
@@ -262,6 +265,71 @@ YOY_KEYWORDS = ("\u540c\u6bd4", "\u589e\u901f", "\u589e\u5e45", "\u589e\u957f\u7
 MAX_KEYWORDS = ("\u6700\u5927", "\u6700\u9ad8", "\u6700\u591a")
 MIN_KEYWORDS = ("\u6700\u5c0f", "\u6700\u4f4e", "\u6700\u5c11")
 MULTI_INTENT_CONNECTORS = ("\u540c\u65f6", "\u4ee5\u53ca", "\u5e76\u4e14", "\u5e76\u8bf4\u660e", "\u5e76\u5206\u6790", "\u5e76\u89e3\u91ca", "\u5e76\u7ed9\u51fa", "\u5e76\u6307\u51fa", "\u5206\u522b")
+COMPANY_SET_FOLLOW_UP_HINTS = ("\u5176\u4e2d", "\u91cc\u9762", "\u8fd9\u4e9b\u516c\u53f8\u91cc", "\u8fd9\u4e9b\u4f01\u4e1a\u91cc", "\u524d\u5341\u4f01\u4e1a\u91cc", "\u90a3\u4e9b\u516c\u53f8\u91cc")
+COMPARE_KEYWORDS = ("\u6bd4\u8f83", "\u5bf9\u6bd4", "\u5bf9\u7167")
+THRESHOLD_KEYWORDS = ("\u6ee1\u8db3", "\u8d85\u8fc7", "\u9ad8\u4e8e", "\u4f4e\u4e8e", "\u4e0d\u8d85\u8fc7", "\u4e0d\u4f4e\u4e8e", "\u5927\u4e8e", "\u5c0f\u4e8e")
+MAX_GROWTH_HINTS = ("\u540c\u6bd4\u589e\u5e45\u6700\u5927", "\u589e\u957f\u6700\u5feb", "\u589e\u5e45\u6700\u5927", "\u4e0a\u6da8\u6700\u591a")
+
+CORE_FINANCIAL_TABLES = (
+    "income_sheet",
+    "core_performance_indicators_sheet",
+    "balance_sheet",
+    "cash_flow_sheet",
+)
+
+KEY_LINEAGE_FIELDS = {
+    "total_operating_revenue",
+    "main_business_revenue",
+    "net_profit",
+    "total_profit",
+    "operating_cf_net_amount",
+    "asset_total_assets",
+    "equity_parent_net_assets",
+    "eps",
+    "diluted_eps",
+    "roe",
+}
+
+FOCUSED_AMOUNT_COLUMNS = {
+    "total_operating_revenue",
+    "main_business_revenue",
+    "net_profit",
+    "total_profit",
+    "asset_total_assets",
+    "asset_cash_and_cash_equivalents",
+    "asset_accounts_receivable",
+    "asset_inventory",
+    "liability_total_liabilities",
+    "equity_parent_net_assets",
+    "operating_cf_net_amount",
+    "investing_cf_net_amount",
+    "financing_cf_net_amount",
+}
+
+RATIO_GROWTH_COLUMNS = {
+    "net_profit_yoy_growth",
+    "operating_revenue_yoy_growth",
+    "main_business_revenue_yoy_growth",
+    "total_profit_yoy_growth",
+    "asset_total_assets_yoy_growth",
+    "liability_total_liabilities_yoy_growth",
+    "net_cash_flow_yoy_growth",
+    "asset_liability_ratio",
+    "gross_profit_margin",
+    "net_profit_margin",
+    "roe",
+    "roe_weighted_excl_non_recurring",
+    "operating_revenue_qoq_growth",
+    "net_profit_qoq_growth",
+}
+
+CANONICAL_QUERY_REWRITE_RULES: tuple[tuple[str, str], ...] = (
+    (r"(?:\u8c01|\u54ea\u5bb6|\u54ea\u4e2a\u516c\u53f8).*(?:\u589e\u957f\u6700\u5feb|\u589e\u5e45\u6700\u5927|\u4e0a\u6da8\u6700\u591a|\u540c\u6bd4\u6700\u9ad8)", "\u540c\u6bd4\u589e\u5e45\u6700\u5927"),
+    (r"(?:\u8fd1\u51e0\u5e74|\u8fd1\u4e09\u5e74|\u8fd1\u4e94\u5e74).*(?:\u8d8b\u52bf|\u53d8\u5316).*(?:\u539f\u56e0|\u5206\u6790\u539f\u56e0|\u89e3\u91ca\u539f\u56e0)", "\u8d8b\u52bf \u5e76\u5206\u6790\u539f\u56e0"),
+    (r"(?:\u5217\u51fa|\u627e\u51fa|\u7b5b\u9009).*(?:\u516c\u53f8|\u4f01\u4e1a).*(?:\u6bd4\u8f83|\u5bf9\u6bd4).*(?:\u540c\u6bd4|\u589e\u5e45)", "\u5217\u51fa\u4f01\u4e1a \u5e76\u6bd4\u8f83\u540c\u6bd4"),
+    (r"(?:\u54ea\u4e9b|\u54ea\u4e9b\u516c\u53f8).*(?:\u6ee1\u8db3|\u8d85\u8fc7|\u9ad8\u4e8e|\u4f4e\u4e8e).*(?:\u6700\u9ad8|\u6700\u4f4e|\u6700\u5927|\u6700\u5c0f)", "\u9608\u503c\u7b5b\u9009 \u5e76 \u627e\u6700\u9ad8\u6700\u4f4e"),
+    (r"(?:\u5148|\u5148\u628a).*(?:\u7ed8\u56fe|\u753b\u56fe|\u53ef\u89c6\u5316).*(?:\u518d|\u7136\u540e).*(?:\u89e3\u91ca|\u5206\u6790|\u539f\u56e0)", "\u8d8b\u52bf\u7ed8\u56fe \u5e76 \u5206\u6790\u539f\u56e0"),
+)
 
 
 QUARTER_1_FLAGS = ("\u7b2c\u4e00\u5b63\u5ea6", "\u4e00\u5b63\u5ea6", "Q1", "q1")
@@ -317,6 +385,20 @@ def is_valid_report_period(value: Any) -> bool:
     return bool(PERIOD_PATTERN.fullmatch(normalize_report_period(value)))
 
 
+def report_period_suffix(value: Any) -> str:
+    normalized = normalize_report_period(value)
+    match = re.fullmatch(r"20\d{2}(FY|HY|Q1|Q2|Q3|Q4)", normalized)
+    return match.group(1) if match else ""
+
+
+def previous_report_period(value: Any) -> str | None:
+    normalized = normalize_report_period(value)
+    match = re.fullmatch(r"(20\d{2})(FY|HY|Q1|Q2|Q3|Q4)", normalized)
+    if not match:
+        return None
+    return f"{int(match.group(1)) - 1}{match.group(2)}"
+
+
 def has_encoding_issue(text: Any) -> bool:
     probe = normalize_text(str(text or ""))
     if not probe:
@@ -336,6 +418,10 @@ def has_encoding_issue(text: Any) -> bool:
 
 def get_standard_metric_label(table: str, column: str) -> str:
     return STANDARD_METRIC_LABELS[(table, column)]
+
+
+def get_metric_label_by_column(column: str) -> str:
+    return STANDARD_METRIC_LABELS_BY_COLUMN.get(column, column)
 
 
 def parse_question_payload(raw: str) -> list[dict[str, str]]:
@@ -495,3 +581,69 @@ def format_money_from_10k(value: Any) -> str:
     if abs(number) >= 10000:
         return f"{number / 10000:.2f}\u4ebf\u5143"
     return f"{number:,.2f}\u4e07\u5143"
+
+
+def median_value(values: Iterable[float]) -> float | None:
+    cleaned = sorted(float(value) for value in values)
+    if not cleaned:
+        return None
+    middle = len(cleaned) // 2
+    if len(cleaned) % 2:
+        return cleaned[middle]
+    return (cleaned[middle - 1] + cleaned[middle]) / 2.0
+
+
+def percentile_value(values: Iterable[float], ratio: float) -> float | None:
+    cleaned = sorted(float(value) for value in values)
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned[0]
+    index = max(0, min(len(cleaned) - 1, round((len(cleaned) - 1) * ratio)))
+    return cleaned[index]
+
+
+def safe_abs_ratio(current: Any, previous: Any) -> float | None:
+    current_value = abs(to_float(current) or 0.0)
+    previous_value = abs(to_float(previous) or 0.0)
+    if current_value == 0 and previous_value == 0:
+        return 1.0
+    if current_value == 0 or previous_value == 0:
+        return None
+    larger = max(current_value, previous_value)
+    smaller = min(current_value, previous_value)
+    if smaller == 0:
+        return None
+    return larger / smaller
+
+
+def relative_change_multiple(current: Any, previous: Any) -> float | None:
+    current_value = to_float(current)
+    previous_value = to_float(previous)
+    if current_value is None or previous_value is None:
+        return None
+    previous_abs = abs(previous_value)
+    if previous_abs == 0:
+        return None
+    return abs(current_value) / previous_abs
+
+
+def has_order_of_magnitude_gap(current: Any, previous: Any, *, factor: float = 30.0) -> bool:
+    ratio = safe_abs_ratio(current, previous)
+    return ratio is not None and ratio >= factor
+
+
+def canonicalize_query_text(question: str) -> str:
+    normalized = normalize_text(question)
+    canonical = normalized
+    lower = compact_text(normalized).lower()
+    if "\u8fd9\u4e9b\u516c\u53f8\u91cc" in canonical and "\u4f01\u4e1a" not in canonical:
+        canonical = canonical.replace("\u8fd9\u4e9b\u516c\u53f8\u91cc", "\u8fd9\u4e9b\u4f01\u4e1a\u91cc")
+    if "\u91cc\u9762" in canonical and "\u5176\u4e2d" not in canonical:
+        canonical = canonical.replace("\u91cc\u9762", "\u5176\u4e2d")
+    for pattern, replacement in CANONICAL_QUERY_REWRITE_RULES:
+        if replacement in canonical:
+            continue
+        if re.search(pattern, lower if pattern.isascii() else canonical):
+            canonical = f"{canonical} {replacement}".strip()
+    return normalize_text(canonical)

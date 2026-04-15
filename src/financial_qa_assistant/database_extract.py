@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
@@ -13,7 +14,7 @@ from .database_base import (
     write_financial_table,
 )
 from .pdf_tools import extract_text_safe, infer_pdf_metadata
-from .utils import ensure_relative_path, normalize_report_period, normalize_stock_code, to_float
+from .utils import KEY_LINEAGE_FIELDS, ensure_relative_path, normalize_report_period, normalize_stock_code, to_float
 
 
 LogFn = Callable[[str], None]
@@ -491,19 +492,19 @@ PERCENTAGE_FIELDS = {
 EPS_FIELDS = {"eps", "diluted_eps", "net_asset_per_share", "operating_cf_per_share"}
 
 AMOUNT_FIELD_LIMITS_10K: dict[str, float] = {
-    "total_operating_revenue": 100_000_000.0,
-    "main_business_revenue": 100_000_000.0,
-    "net_profit": 50_000_000.0,
-    "total_profit": 50_000_000.0,
-    "asset_total_assets": 500_000_000.0,
-    "asset_cash_and_cash_equivalents": 100_000_000.0,
-    "asset_accounts_receivable": 100_000_000.0,
-    "asset_inventory": 100_000_000.0,
-    "liability_total_liabilities": 500_000_000.0,
-    "equity_parent_net_assets": 300_000_000.0,
-    "operating_cf_net_amount": 50_000_000.0,
-    "investing_cf_net_amount": 50_000_000.0,
-    "financing_cf_net_amount": 50_000_000.0,
+    "total_operating_revenue": 30_000_000.0,
+    "main_business_revenue": 30_000_000.0,
+    "net_profit": 5_000_000.0,
+    "total_profit": 5_000_000.0,
+    "asset_total_assets": 40_000_000.0,
+    "asset_cash_and_cash_equivalents": 8_000_000.0,
+    "asset_accounts_receivable": 8_000_000.0,
+    "asset_inventory": 8_000_000.0,
+    "liability_total_liabilities": 35_000_000.0,
+    "equity_parent_net_assets": 20_000_000.0,
+    "operating_cf_net_amount": 8_000_000.0,
+    "investing_cf_net_amount": 8_000_000.0,
+    "financing_cf_net_amount": 8_000_000.0,
 }
 
 MAX_RAW_AMOUNT = 1_000_000_000_000_000.0
@@ -615,11 +616,25 @@ def _sanitize_field_value(field: str, value: Any) -> Any:
     if number is None:
         return value
     if field in PERCENTAGE_FIELDS or field.endswith("_growth") or field.endswith("_ratio"):
-        return None if abs(number) > 500 else number
+        if field == "asset_liability_ratio" and not (0.0 <= number <= 100.0):
+            return None
+        if field in {"roe", "roe_weighted_excl_non_recurring"} and abs(number) > 80:
+            return None
+        return None if abs(number) > 300 else number
     if field in EPS_FIELDS:
-        return None if abs(number) > 100 else number
+        return None if abs(number) > 20 else number
     limit = AMOUNT_FIELD_LIMITS_10K.get(field)
     if limit is not None and abs(number) > limit:
+        return None
+    if field in {
+        "total_operating_revenue",
+        "main_business_revenue",
+        "asset_total_assets",
+        "asset_cash_and_cash_equivalents",
+        "asset_accounts_receivable",
+        "asset_inventory",
+        "equity_parent_net_assets",
+    } and number < 0:
         return None
     return number
 
@@ -632,7 +647,37 @@ def _values_conflict(existing: Any, candidate: Any) -> bool:
     return existing not in (None, "") and candidate not in (None, "") and existing != candidate
 
 
-def _record_conflict(row: dict[str, Any], field: str, existing: Any, candidate: Any, chosen_priority: int, candidate_priority: int) -> None:
+def _build_lineage_meta(row: dict[str, Any], field: str, value: Any, priority: int) -> dict[str, Any]:
+    extractor_stage = str(row.get("__extractor_stage__") or row.get("source_excerpt") or "")
+    return {
+        "field_name": field,
+        "field_value": to_float(value) if to_float(value) is not None else value,
+        "source_file": str(row.get("source_file") or ""),
+        "source_excerpt": str(row.get("source_excerpt") or ""),
+        "source_priority": int(priority),
+        "extractor_stage": extractor_stage,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _remember_lineage(row: dict[str, Any], field: str, value: Any, priority: int) -> None:
+    if field not in KEY_LINEAGE_FIELDS:
+        return
+    row.setdefault("__field_lineage__", {})[field] = _build_lineage_meta(row, field, value, priority)
+
+
+def _record_conflict(
+    row: dict[str, Any],
+    field: str,
+    existing: Any,
+    candidate: Any,
+    chosen_priority: int,
+    candidate_priority: int,
+    *,
+    chosen_meta: dict[str, Any] | None = None,
+    candidate_meta: dict[str, Any] | None = None,
+    decision: str = "keep_existing",
+) -> None:
     conflicts = row.setdefault("__conflicts__", [])
     if len(conflicts) >= 50:
         return
@@ -645,6 +690,26 @@ def _record_conflict(row: dict[str, Any], field: str, existing: Any, candidate: 
             "candidate_priority": candidate_priority,
         }
     )
+    if field in KEY_LINEAGE_FIELDS:
+        lineage_conflicts = row.setdefault("__lineage_conflicts__", [])
+        if len(lineage_conflicts) < 100:
+            lineage_conflicts.append(
+                {
+                    "field_name": field,
+                    "decision": decision,
+                    "chosen_value": existing if decision == "keep_existing" else candidate,
+                    "chosen_source_file": (chosen_meta or {}).get("source_file", ""),
+                    "chosen_source_excerpt": (chosen_meta or {}).get("source_excerpt", ""),
+                    "chosen_priority": int((chosen_meta or {}).get("source_priority", chosen_priority) or chosen_priority),
+                    "chosen_extractor_stage": (chosen_meta or {}).get("extractor_stage", ""),
+                    "candidate_value": candidate if decision == "keep_existing" else existing,
+                    "candidate_source_file": (candidate_meta or {}).get("source_file", ""),
+                    "candidate_source_excerpt": (candidate_meta or {}).get("source_excerpt", ""),
+                    "candidate_priority": int((candidate_meta or {}).get("source_priority", candidate_priority) or candidate_priority),
+                    "candidate_extractor_stage": (candidate_meta or {}).get("extractor_stage", ""),
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
 
 
 def _ensure_row(
@@ -671,6 +736,9 @@ def _ensure_row(
             "__row_priority__": priority,
             "__field_priority__": {},
             "__conflicts__": [],
+            "__field_lineage__": {},
+            "__lineage_conflicts__": [],
+            "__extractor_stage__": source_excerpt,
         },
     )
     current_priority = int(row.get("__row_priority__", -1) or -1)
@@ -681,9 +749,11 @@ def _ensure_row(
             row["source_file"] = source_file
         if source_excerpt:
             row["source_excerpt"] = source_excerpt
+            row["__extractor_stage__"] = source_excerpt
         row["__row_priority__"] = priority
     elif source_excerpt and not row.get("source_excerpt"):
         row["source_excerpt"] = source_excerpt
+        row["__extractor_stage__"] = source_excerpt
     if stock_abbr and not row.get("stock_abbr"):
         row["stock_abbr"] = stock_abbr
     if report_period[:4].isdigit() and not row.get("report_year"):
@@ -697,12 +767,26 @@ def _assign(row: dict[str, Any], field: str, value: Any, priority: int = 0) -> N
     priorities = row.setdefault("__field_priority__", {})
     current_priority = int(priorities.get(field, -1) or -1)
     current_value = row.get(field)
+    candidate_meta = _build_lineage_meta(row, field, value, priority)
+    current_meta = row.get("__field_lineage__", {}).get(field, {})
     if current_value not in (None, "") and _values_conflict(current_value, value):
-        _record_conflict(row, field, current_value, value, current_priority, priority)
+        choose_candidate = priority >= current_priority
+        _record_conflict(
+            row,
+            field,
+            current_value,
+            value,
+            current_priority,
+            priority,
+            chosen_meta=candidate_meta if choose_candidate else current_meta,
+            candidate_meta=current_meta if choose_candidate else candidate_meta,
+            decision="replace_existing" if choose_candidate else "keep_existing",
+        )
     if priority < current_priority:
         return
     row[field] = value
     priorities[field] = priority
+    _remember_lineage(row, field, value, priority)
 
 def _assign_prefer_reasonable(row: dict[str, Any], field: str, value: Any, priority: int = 0) -> None:
     candidate = _sanitize_field_value(field, value)
@@ -712,13 +796,27 @@ def _assign_prefer_reasonable(row: dict[str, Any], field: str, value: Any, prior
     priorities = row.setdefault("__field_priority__", {})
     current_priority = int(priorities.get(field, -1) or -1)
     current = to_float(row.get(field))
+    candidate_meta = _build_lineage_meta(row, field, candidate, priority)
+    current_meta = row.get("__field_lineage__", {}).get(field, {})
+    choose_candidate = current is None or (priority >= current_priority and (priority > current_priority or (abs(current or 0.0) < 1 and abs(candidate) >= 1)))
     if current is not None and _values_conflict(current, candidate):
-        _record_conflict(row, field, current, candidate, current_priority, priority)
+        _record_conflict(
+            row,
+            field,
+            current,
+            candidate,
+            current_priority,
+            priority,
+            chosen_meta=candidate_meta if choose_candidate else current_meta,
+            candidate_meta=current_meta if choose_candidate else candidate_meta,
+            decision="replace_existing" if choose_candidate else "keep_existing",
+        )
     if priority < current_priority:
         return
     if current is None or priority > current_priority or (abs(current) < 1 and abs(candidate) >= 1):
         row[field] = candidate
         priorities[field] = priority
+        _remember_lineage(row, field, candidate, priority)
 
 def _cumulative_quarter_values(values: list[float | None]) -> list[float | None]:
     running_total = 0.0
@@ -962,6 +1060,21 @@ def _collect_conflicts_v2(table: str, rows: dict[tuple[str, str], dict[str, Any]
     conflicts: list[dict[str, Any]] = []
     for (stock_code, report_period), row in rows.items():
         for item in row.get("__conflicts__", []):
+            conflicts.append(
+                {
+                    "table": table,
+                    "stock_code": stock_code,
+                    "report_period": report_period,
+                    **item,
+                }
+            )
+    return conflicts
+
+
+def _collect_lineage_conflicts_v2(table: str, rows: dict[tuple[str, str], dict[str, Any]]) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    for (stock_code, report_period), row in rows.items():
+        for item in row.get("__lineage_conflicts__", []):
             conflicts.append(
                 {
                     "table": table,
@@ -1421,6 +1534,12 @@ def load_financial_reports(database: Database, config: AppConfig, log: LogFn | N
             + _collect_conflicts_v2("balance_sheet", balance_rows)
             + _collect_conflicts_v2("cash_flow_sheet", cash_rows)
         )[:200],
+        "lineage_conflicts": (
+            _collect_lineage_conflicts_v2("income_sheet", income_rows)
+            + _collect_lineage_conflicts_v2("core_performance_indicators_sheet", kpi_rows)
+            + _collect_lineage_conflicts_v2("balance_sheet", balance_rows)
+            + _collect_lineage_conflicts_v2("cash_flow_sheet", cash_rows)
+        )[:300],
         "coverage": {
             "income_sheet": len(income_rows),
             "core_performance_indicators_sheet": len(kpi_rows),

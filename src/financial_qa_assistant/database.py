@@ -25,6 +25,13 @@ from .validation import run_validation
 
 
 LogFn = Callable[[str], None]
+MASTER_ALIGNMENT_TABLES = (
+    "income_sheet",
+    "balance_sheet",
+    "cash_flow_sheet",
+    "core_performance_indicators_sheet",
+    "financial_metric_facts",
+)
 
 
 def _emit(log: LogFn | None, message: str) -> None:
@@ -85,6 +92,72 @@ def _write_ingest_manifest(config) -> None:
 
 def _write_ingest_report(config, payload: dict[str, object]) -> None:
     config.ingest_report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _rebuild_financial_company_aliases(database: Database, log: LogFn | None = None) -> dict[str, int]:
+    if not database.table_exists("financial_company_aliases"):
+        return {"alias_count": 0, "missing_company_info_count": 0}
+    known_codes = {
+        str(row["stock_code"] or "")
+        for row in database.query("SELECT stock_code FROM company_info WHERE stock_code <> ''")
+    }
+    preferred_names: dict[str, tuple[str, str]] = {}
+    if database.table_exists("document_chunks"):
+        for row in database.query(
+            """
+            SELECT stock_code, stock_name
+            FROM document_chunks
+            WHERE stock_code <> '' AND stock_name <> ''
+            GROUP BY stock_code, stock_name
+            """
+        ):
+            stock_code = str(row["stock_code"] or "").strip()
+            stock_name = str(row["stock_name"] or "").strip()
+            if stock_code and stock_name and stock_code not in preferred_names:
+                preferred_names[stock_code] = (stock_name, stock_name)
+    alias_rows: dict[tuple[str, str], tuple[str, str, str, str, str]] = {}
+    for table in MASTER_ALIGNMENT_TABLES:
+        if not database.table_exists(table):
+            continue
+        columns = database.table_columns(table)
+        if "stock_code" not in columns:
+            continue
+        stock_abbr_expr = "stock_abbr" if "stock_abbr" in columns else "''"
+        rows = database.query(
+            f"""
+            SELECT DISTINCT stock_code, {stock_abbr_expr} AS stock_abbr
+            FROM {table}
+            WHERE stock_code <> '' OR {stock_abbr_expr} <> ''
+            """
+        )
+        for row in rows:
+            stock_code = str(row["stock_code"] or "").strip()
+            stock_abbr = str(row["stock_abbr"] or "").strip()
+            if not stock_code or stock_code in known_codes:
+                continue
+            preferred_abbr, preferred_name = preferred_names.get(stock_code, ("", ""))
+            alias_abbr = stock_abbr or preferred_abbr
+            company_name = preferred_name or alias_abbr or stock_code
+            alias_rows[(stock_code, table)] = (
+                stock_code,
+                alias_abbr,
+                company_name,
+                table,
+                "inferred_from_financial_tables",
+            )
+    database.execute("DELETE FROM financial_company_aliases")
+    if alias_rows:
+        database.executemany(
+            """
+            INSERT INTO financial_company_aliases (
+                stock_code, stock_abbr, company_name, source_table, source
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            alias_rows.values(),
+        )
+    missing_codes = len({item[0] for item in alias_rows.values()})
+    _emit(log, f"财务事实别名补救：新增 {len(alias_rows)} 条别名，覆盖 {missing_codes} 个缺失 stock_code")
+    return {"alias_count": len(alias_rows), "missing_company_info_count": missing_codes}
 
 
 def ingest_manifest_matches(config) -> bool:
@@ -163,6 +236,7 @@ def ingest_all(config, log: LogFn | None = None):
     stage_durations: dict[str, float] = {}
     extraction_report: dict[str, Any] = {}
     validation_report: dict[str, Any] = {}
+    alignment_report: dict[str, int] = {}
 
     _emit(log, f"建库目标：{config.db_path}")
     _emit(log, f"正式数据目录：{config.contest_data_dir}")
@@ -198,6 +272,11 @@ def ingest_all(config, log: LogFn | None = None):
         stage_durations["导入种子 CSV"] = _run_step(log, "导入种子 CSV", lambda: load_seed_csvs(database, config))
         stage_durations["导入手工补录 CSV"] = _run_step(log, "导入手工补录 CSV", lambda: load_manual_csvs(database, config))
         stage_durations["刷新指标事实表"] = _run_step(log, "刷新指标事实表", lambda: refresh_metric_facts(database))
+        stage_durations["主数据自动对齐"] = _run_step(
+            log,
+            "主数据自动对齐",
+            lambda: alignment_report.update(_rebuild_financial_company_aliases(database, log)),
+        )
 
         def _run_validation_stage() -> None:
             nonlocal validation_report
@@ -238,6 +317,7 @@ def ingest_all(config, log: LogFn | None = None):
             "stage_durations_seconds": {key: round(value, 3) for key, value in stage_durations.items()},
             "validation_report": str((config.runtime_dir / "validation_report.json").resolve()),
             "validation_summary": validation_report.get("summary", {}),
+            "master_data_alignment": alignment_report,
         }
         _write_ingest_report(config, report_payload)
         _emit(log, f"建库报告：{config.ingest_report_path}")
@@ -269,6 +349,7 @@ def ingest_all(config, log: LogFn | None = None):
             "stage_durations_seconds": {key: round(value, 3) for key, value in stage_durations.items()},
             "validation_report": str((config.runtime_dir / "validation_report.json").resolve()),
             "validation_summary": validation_report.get("summary", {}),
+            "master_data_alignment": alignment_report,
             "error": {
                 "type": type(exc).__name__,
                 "message": str(exc),
